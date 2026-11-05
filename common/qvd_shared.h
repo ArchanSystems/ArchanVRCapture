@@ -1,18 +1,18 @@
-// VR Capture - shared protocol between the OpenXR layer (inside the game)
+// Archan VR Capture - shared protocol between the OpenXR layer (inside the game)
 // and the OBS source plugin. Picture only: the left eye image of the game's
 // projection layer, copied into a D3D11 shared texture with a keyed mutex.
 #pragma once
 #include <stdint.h>
 
-#define QVD_SHM_NAME L"Local\\VRCapture_Picture_v1"
+#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v1"
 
-/* Channel name. Tests set VRCAPTURE_TEST_CHANNEL in their own processes so they never
+/* Channel name. Tests set ARCHAN_VRCAPTURE_TEST_CHANNEL in their own processes so they never
  * touch the real channel of a running game or OBS. Requires <windows.h> before this header. */
 static inline const wchar_t *qvd_channel_name(void)
 {
 	static wchar_t name[128];
 	if (!name[0]) {
-		const DWORD n = GetEnvironmentVariableW(L"VRCAPTURE_TEST_CHANNEL", name, 128);
+		const DWORD n = GetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", name, 128);
 		if (n == 0 || n >= 128)
 			wcscpy_s(name, 128, QVD_SHM_NAME);
 	}

@@ -1,9 +1,9 @@
-// VR Capture - OBS source plugin (picture only).
+// Archan VR Capture - OBS source plugin (picture only).
 //
-// Source "VR Capture": shows the centre 16:9 crop of the game's left eye.
+// Source "Archan VR Capture": shows the centre 16:9 crop of the game's left eye.
 // Picture sources, in this order:
 //  1. OpenXR games (VDXR, Pimax, SteamVR OpenXR...): the game's own left eye, delivered
-//     by the XR_APILAYER_VRCAPTURE_obs OpenXR layer through a D3D11 shared texture.
+//     by the XR_APILAYER_ARCHAN_vr_capture OpenXR layer through a D3D11 shared texture.
 //  2. Otherwise, if SteamVR runs (OpenVR games): SteamVR's left eye mirror texture
 //     (IVRCompositor::GetMirrorTextureD3D11), read as a background OpenVR app.
 //     No mirror window is used.
@@ -35,9 +35,9 @@
 #include "../common/qvd_shared.h"
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE("vr-capture", "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("archan-vr-capture", "en-US")
 
-#define LOG(level, fmt, ...) blog(level, "[vr-capture] " fmt, ##__VA_ARGS__)
+#define LOG(level, fmt, ...) blog(level, "[archan-vr-capture] " fmt, ##__VA_ARGS__)
 
 namespace {
 
@@ -519,7 +519,7 @@ void KeepVideoSize(QvdSource *s);
 // ---------------------------------------------------------------- source callbacks
 const char *qvd_get_name(void *)
 {
-	return obs_module_text("VRCapture");
+	return obs_module_text("ArchanVRCapture");
 }
 
 void qvd_update(void *data, obs_data_t *settings)
@@ -723,7 +723,7 @@ void qvd_get_defaults(obs_data_t *settings)
 bool obs_module_load(void)
 {
 	struct obs_source_info info = {};
-	info.id = "vr_capture";
+	info.id = "archan_vr_capture";
 	info.type = OBS_SOURCE_TYPE_INPUT;
 	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_SRGB;
 	info.get_name = qvd_get_name;
@@ -738,18 +738,22 @@ bool obs_module_load(void)
 	info.icon_type = OBS_ICON_TYPE_GAME_CAPTURE;
 	obs_register_source(&info);
 
-	// Old id from before the rename: hidden from "Add source", but scenes that already
-	// contain it keep loading (as VR Capture).
-	struct obs_source_info old = info;
-	old.id = "quest_vd_vr_picture";
-	old.output_flags |= OBS_SOURCE_DEPRECATED;
-	obs_register_source(&old);
+	// Old ids from before the renames ("Quest VR Picture", "VR Capture"): hidden from
+	// "Add source", but scenes that already contain them keep loading (as Archan VR Capture).
+	static const char *const oldIds[] = {"quest_vd_vr_picture", "vr_capture"};
+	for (const char *id : oldIds) {
+		struct obs_source_info old = info;
+		old.id = id;
+		old.output_flags |= OBS_SOURCE_DEPRECATED;
+		obs_register_source(&old);
+	}
 
 	if (LoadOpenVR()) {
 		g_vrStop = false;
 		g_vrThread = std::thread(VrThread);
 	}
-	LOG(LOG_INFO, "loaded (source 'vr_capture', old id 'quest_vd_vr_picture' kept; SteamVR mirror %s)",
+	LOG(LOG_INFO,
+	    "loaded (source 'archan_vr_capture', old ids 'quest_vd_vr_picture' 'vr_capture' kept; SteamVR mirror %s)",
 	    g_openvr ? "on" : "off");
 	return true;
 }

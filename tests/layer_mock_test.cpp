@@ -282,11 +282,11 @@ static int RunWriter(const char *exePath, const char *layerPath)
 				    sizeof(li), 1, 1, XR_MAKE_VERSION(1, 0, 0), XR_MAKE_VERSION(1, 0x3ff, 0xfff)};
 	XrNegotiateApiLayerRequest rq = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST,
 					 XR_API_LAYER_INFO_STRUCT_VERSION, sizeof(rq)};
-	CHECK(negotiate(&li, "XR_APILAYER_VRCAPTURE_obs", &rq) == XR_SUCCESS, "negotiate");
+	CHECK(negotiate(&li, "XR_APILAYER_ARCHAN_vr_capture", &rq) == XR_SUCCESS, "negotiate");
 
 	XrApiLayerNextInfo next = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_NEXT_INFO, XR_API_LAYER_NEXT_INFO_STRUCT_VERSION,
 				   sizeof(next)};
-	strcpy_s(next.layerName, "XR_APILAYER_VRCAPTURE_obs");
+	strcpy_s(next.layerName, "XR_APILAYER_ARCHAN_vr_capture");
 	next.nextGetInstanceProcAddr = mock_GIPA;
 	next.nextCreateApiLayerInstance = mock_CreateApiLayerInstance;
 	XrApiLayerCreateInfo lci = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO,
@@ -575,10 +575,10 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 				    sizeof(li), 1, 1, XR_MAKE_VERSION(1, 0, 0), XR_MAKE_VERSION(1, 0x3ff, 0xfff)};
 	XrNegotiateApiLayerRequest rq = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST,
 					 XR_API_LAYER_INFO_STRUCT_VERSION, sizeof(rq)};
-	CHECK(negotiate(&li, "XR_APILAYER_VRCAPTURE_obs", &rq) == XR_SUCCESS, "negotiate");
+	CHECK(negotiate(&li, "XR_APILAYER_ARCHAN_vr_capture", &rq) == XR_SUCCESS, "negotiate");
 	XrApiLayerNextInfo next = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_NEXT_INFO, XR_API_LAYER_NEXT_INFO_STRUCT_VERSION,
 				   sizeof(next)};
-	strcpy_s(next.layerName, "XR_APILAYER_VRCAPTURE_obs");
+	strcpy_s(next.layerName, "XR_APILAYER_ARCHAN_vr_capture");
 	next.nextGetInstanceProcAddr = mock_GIPA;
 	next.nextCreateApiLayerInstance = mock_CreateApiLayerInstance;
 	XrApiLayerCreateInfo lci = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO,
@@ -698,8 +698,8 @@ static int RunCropTest()
 int main(int argc, char **argv)
 {
 	// own channel name for this test and its child processes: never the real one of a running game/OBS
-	if (!GetEnvironmentVariableW(L"VRCAPTURE_TEST_CHANNEL", nullptr, 0))
-		SetEnvironmentVariableW(L"VRCAPTURE_TEST_CHANNEL", L"Local\\VRCapture_TestChannel");
+	if (!GetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", nullptr, 0))
+		SetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", L"Local\\ArchanVRCapture_TestChannel");
 	if (argc >= 2 && strcmp(argv[1], "--reader") == 0)
 		return RunReader();
 	if (argc >= 2 && strcmp(argv[1], "--idle") == 0) {

@@ -1,11 +1,11 @@
-# VR Capture
+# Archan VR Capture
 
 Records the game's VR picture in 16:9 with OBS. Picture only: sound and mic
 are set up in OBS's own audio settings.
 
 Where the picture comes from (first one that has a picture wins):
 1. **OpenXR games** on any runtime (Virtual Desktop VDXR, Pimax, SteamVR OpenXR):
-   the game's own left eye, through the VR Capture OpenXR layer. PimaxHome is skipped.
+   the game's own left eye, through the Archan VR Capture OpenXR layer. PimaxHome is skipped.
    Pimax quad views: view 0 = the wide left view.
 2. **SteamVR games (OpenVR)**: SteamVR's left eye mirror texture, read by OBS as a
    background SteamVR app (never starts SteamVR, no mirror window). This is SteamVR's
@@ -15,8 +15,8 @@ Where the picture comes from (first one that has a picture wins):
 
 | Part | File | What it does |
 |---|---|---|
-| OpenXR layer | `layer/layer.cpp` → `XR_APILAYER_VRCAPTURE_obs.dll` | Runs inside the game. On every frame it copies the **left eye** image (view 0 of the projection layer) into a GPU shared texture. It copies only while OBS is showing the source. |
-| OBS plugin | `obs-plugin/plugin.cpp` → `vr-capture.dll` (+ `openvr_api.dll`, OpenVR SDK v2.15.6) | Source **"VR Capture"**. Shows the **centre 16:9 crop** of the left eye, filling the canvas. |
+| OpenXR layer | `layer/layer.cpp` → `XR_APILAYER_ARCHAN_vr_capture.dll` | Runs inside the game. On every frame it copies the **left eye** image (view 0 of the projection layer) into a GPU shared texture. It copies only while OBS is showing the source. |
+| OBS plugin | `obs-plugin/plugin.cpp` → `archan-vr-capture.dll` (+ `openvr_api.dll`, OpenVR SDK v2.15.6) | Source **"Archan VR Capture"**. Shows the **centre 16:9 crop** of the left eye, filling the canvas. |
 | Resolution picker | in the source's Properties | **HMD res (automatic)** (default): canvas and output = the exact 16:9 crop of the left eye, 1:1 pixels (2496×1404 for a 2496×2688 eye), following the eye size by itself. **1080p**: 1920×1080. Only the canvas and output resolution of the active profile are changed, and only while no recording/stream/replay buffer/virtual camera is running. |
 
 ## Build / install
@@ -28,22 +28,22 @@ Where the picture comes from (first one that has a picture wins):
 ```
 
 Install locations:
-- Layer: `%LOCALAPPDATA%\VRCapture\layer\`, registered in
+- Layer: `%LOCALAPPDATA%\ArchanVRCapture\layer\`, registered in
   `HKCU\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit`
-- Plugin: `%ProgramData%\obs-studio\plugins\vr-capture\`
+- Plugin: `%ProgramData%\obs-studio\plugins\archan-vr-capture\`
 
 ## Use
 
 1. Start the game in VR (Virtual Desktop, Pimax or SteamVR).
-2. In OBS: Sources → + → **VR Capture**.
+2. In OBS: Sources → + → **Archan VR Capture**.
 3. In its Properties, pick **HMD res (automatic)** or **1080p**. OBS switches by itself
    once the game picture shows (it waits while recording/streaming runs).
 4. Record with OBS as usual.
 
 ## Logs
 
-- Layer: `%LOCALAPPDATA%\VRCapture\logs\layer.log` (app, runtime, eye size, format, FOV)
-- Plugin: the OBS log, lines starting with `[vr-capture]`
+- Layer: `%LOCALAPPDATA%\ArchanVRCapture\logs\layer.log` (app, runtime, eye size, format, FOV)
+- Plugin: the OBS log, lines starting with `[archan-vr-capture]`
 
 ## Limits
 
@@ -55,17 +55,17 @@ Install locations:
 - HKCU layers are ignored by the OpenXR loader if the game runs as administrator.
 - One game at a time is sent to OBS. A running app that holds the channel but sends no
   frame for 2 s while OBS is watching (e.g. PimaxHome) is taken over by the game.
-- Tests use their own channel (`VRCAPTURE_TEST_CHANNEL`, set only inside the test processes), so a
+- Tests use their own channel (`ARCHAN_VRCAPTURE_TEST_CHANNEL`, set only inside the test processes), so a
   running game or OBS is never touched. They still refuse (exit 3, "NOT RUN") if that test channel is in use.
 
 ## Tests (no headset needed)
 
 ```powershell
 build\layer_mock_test.exe --crop
-build\layer_mock_test.exe build\XR_APILAYER_VRCAPTURE_obs.dll
-build\layer_mock_test.exe build\XR_APILAYER_VRCAPTURE_obs.dll --d3d12
+build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll
+build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll --d3d12
 # run from C:\Program Files\obs-studio\bin\64bit:
-build\plugin_render_test.exe build\vr-capture.dll obs-plugin\data
+build\plugin_render_test.exe build\archan-vr-capture.dll obs-plugin\data
 ```
 
 ## Dependencies (in `deps/`, not committed)

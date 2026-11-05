@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(VRCapture LANGUAGES CXX)
+project(ArchanVRCapture LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,15 +13,15 @@ add_compile_definitions(UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 add_compile_options(/W3 /utf-8)
 
 # ---------------------------------------------------------------- OpenXR layer (loaded into the game)
-add_library(XR_APILAYER_VRCAPTURE_obs SHARED layer/layer.cpp)
-target_include_directories(XR_APILAYER_VRCAPTURE_obs PRIVATE "${DEPS}/openxr-sdk/include")
-target_link_libraries(XR_APILAYER_VRCAPTURE_obs PRIVATE d3d11 dxgi shell32 ole32)
+add_library(XR_APILAYER_ARCHAN_vr_capture SHARED layer/layer.cpp)
+target_include_directories(XR_APILAYER_ARCHAN_vr_capture PRIVATE "${DEPS}/openxr-sdk/include")
+target_link_libraries(XR_APILAYER_ARCHAN_vr_capture PRIVATE d3d11 dxgi shell32 ole32)
 # static CRT: nothing extra has to exist next to the game
-set_property(TARGET XR_APILAYER_VRCAPTURE_obs PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
-add_custom_command(TARGET XR_APILAYER_VRCAPTURE_obs POST_BUILD
+set_property(TARGET XR_APILAYER_ARCHAN_vr_capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_custom_command(TARGET XR_APILAYER_ARCHAN_vr_capture POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_SOURCE_DIR}/layer/XR_APILAYER_VRCAPTURE_obs.json"
-            "$<TARGET_FILE_DIR:XR_APILAYER_VRCAPTURE_obs>/XR_APILAYER_VRCAPTURE_obs.json")
+            "${CMAKE_SOURCE_DIR}/layer/XR_APILAYER_ARCHAN_vr_capture.json"
+            "$<TARGET_FILE_DIR:XR_APILAYER_ARCHAN_vr_capture>/XR_APILAYER_ARCHAN_vr_capture.json")
 
 # ---------------------------------------------------------------- OBS plugin
 file(WRITE "${GENERATED}/obsconfig.h"
@@ -34,15 +34,15 @@ set_target_properties(obs_frontend_import PROPERTIES IMPORTED_IMPLIB "${IMPLIBS}
 
 set(OBS_INCLUDES "${OBS_SRC}/libobs" "${OBS_SRC}/frontend/api" "${GENERATED}")
 
-add_library(vr-capture MODULE obs-plugin/plugin.cpp)
-target_include_directories(vr-capture PRIVATE ${OBS_INCLUDES} "${DEPS}/openvr/headers")
-target_link_libraries(vr-capture PRIVATE obs_import obs_frontend_import user32 d3d11)
-set_property(TARGET vr-capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+add_library(archan-vr-capture MODULE obs-plugin/plugin.cpp)
+target_include_directories(archan-vr-capture PRIVATE ${OBS_INCLUDES} "${DEPS}/openvr/headers")
+target_link_libraries(archan-vr-capture PRIVATE obs_import obs_frontend_import user32 d3d11)
+set_property(TARGET archan-vr-capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 # OpenVR SDK v2.15.6 redistributable, loaded at runtime from the plugin's own folder
-add_custom_command(TARGET vr-capture POST_BUILD
+add_custom_command(TARGET archan-vr-capture POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DEPS}/openvr/bin/win64/openvr_api.dll"
-            "$<TARGET_FILE_DIR:vr-capture>/openvr_api.dll")
+            "$<TARGET_FILE_DIR:archan-vr-capture>/openvr_api.dll")
 
 # ---------------------------------------------------------------- proof tests
 add_executable(layer_mock_test tests/layer_mock_test.cpp)

@@ -1,9 +1,9 @@
 # Removes everything install.ps1 added. Close OBS and the game first.
 $ErrorActionPreference = "Stop"
-$layerDir  = Join-Path $env:LOCALAPPDATA "VRCapture\layer"
-$pluginDir = Join-Path $env:ProgramData "obs-studio\plugins\vr-capture"
+$layerDir  = Join-Path $env:LOCALAPPDATA "ArchanVRCapture\layer"
+$pluginDir = Join-Path $env:ProgramData "obs-studio\plugins\archan-vr-capture"
 $key  = "HKCU:\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
-$json = Join-Path $layerDir "XR_APILAYER_VRCAPTURE_obs.json"
+$json = Join-Path $layerDir "XR_APILAYER_ARCHAN_vr_capture.json"
 
 if (Get-ItemProperty -Path $key -Name $json -ErrorAction SilentlyContinue) {
     Remove-ItemProperty -Path $key -Name $json
@@ -16,4 +16,4 @@ foreach ($d in $layerDir, $pluginDir) {
     if (Test-Path $d) { throw "still present: $d" }
     Write-Host "removed $d"
 }
-Write-Host "UNINSTALL OK (logs kept in $env:LOCALAPPDATA\VRCapture\logs)"
+Write-Host "UNINSTALL OK (logs kept in $env:LOCALAPPDATA\ArchanVRCapture\logs)"

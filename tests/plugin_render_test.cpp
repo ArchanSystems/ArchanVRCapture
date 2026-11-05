@@ -121,11 +121,11 @@ static void SetMode(obs_source_t *src, const char *mode)
 int main(int argc, char **argv)
 {
 	// own channel name for this test and its child processes: never the real one of a running game/OBS
-	if (!GetEnvironmentVariableW(L"VRCAPTURE_TEST_CHANNEL", nullptr, 0))
-		SetEnvironmentVariableW(L"VRCAPTURE_TEST_CHANNEL", L"Local\\VRCapture_TestChannel");
+	if (!GetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", nullptr, 0))
+		SetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", L"Local\\ArchanVRCapture_TestChannel");
 	setvbuf(stdout, nullptr, _IONBF, 0); // keep every line if something crashes
 	if (argc < 3) {
-		printf("usage: plugin_render_test <vr-capture.dll> <plugin data dir>\n");
+		printf("usage: plugin_render_test <archan-vr-capture.dll> <plugin data dir>\n");
 		return 2;
 	}
 
@@ -198,23 +198,27 @@ int main(int argc, char **argv)
 
 	obs_data_t *initial = obs_data_create();
 	obs_data_set_string(initial, "resolution", "1920x1080");
-	obs_source_t *src = obs_source_create("vr_capture", "VR Capture", initial, nullptr);
+	obs_source_t *src = obs_source_create("archan_vr_capture", "Archan VR Capture", initial, nullptr);
 	obs_data_release(initial);
 	CHECK(src, "source create");
 
-	// rename: new id + display name; the old id still loads (old scenes) but is hidden (deprecated)
-	const char *shown = obs_source_get_display_name("vr_capture");
-	printf("source 'vr_capture' display name: '%s'\n", shown ? shown : "(null)");
-	CHECK(shown && strcmp(shown, "VR Capture") == 0, "display name is not 'VR Capture'");
-	const uint32_t oldFlags = obs_get_source_output_flags("quest_vd_vr_picture");
-	printf("old id 'quest_vd_vr_picture' flags 0x%X (deprecated bit %s)\n", oldFlags,
-	       (oldFlags & OBS_SOURCE_DEPRECATED) ? "set" : "NOT set");
-	CHECK((oldFlags & OBS_SOURCE_DEPRECATED) && (oldFlags & OBS_SOURCE_VIDEO), "old id not registered as deprecated");
-	obs_source_t *oldSrc = obs_source_create("quest_vd_vr_picture", "old scene item", nullptr, nullptr);
-	CHECK(oldSrc, "old id can no longer be created (old scenes would break)");
-	obs_source_release(oldSrc);
+	// rename: new id + display name; the old ids still load (old scenes) but are hidden (deprecated)
+	const char *shown = obs_source_get_display_name("archan_vr_capture");
+	printf("source 'archan_vr_capture' display name: '%s'\n", shown ? shown : "(null)");
+	CHECK(shown && strcmp(shown, "Archan VR Capture") == 0, "display name is not 'Archan VR Capture'");
+	CHECK(!(obs_get_source_output_flags("archan_vr_capture") & OBS_SOURCE_DEPRECATED), "new id must not be hidden");
+	for (const char *oldId : {"quest_vd_vr_picture", "vr_capture"}) {
+		const uint32_t oldFlags = obs_get_source_output_flags(oldId);
+		const char *oldName = obs_source_get_display_name(oldId);
+		printf("old id '%s' flags 0x%X (deprecated bit %s), name '%s'\n", oldId, oldFlags,
+		       (oldFlags & OBS_SOURCE_DEPRECATED) ? "set" : "NOT set", oldName ? oldName : "(null)");
+		CHECK((oldFlags & OBS_SOURCE_DEPRECATED) && (oldFlags & OBS_SOURCE_VIDEO), "old id %s not deprecated", oldId);
+		obs_source_t *oldSrc = obs_source_create(oldId, "old scene item", nullptr, nullptr);
+		CHECK(oldSrc, "old id %s can no longer be created (old scenes would break)", oldId);
+		obs_source_release(oldSrc);
+	}
 
-	obs_data_t *defaults = obs_get_source_defaults("vr_capture");
+	obs_data_t *defaults = obs_get_source_defaults("archan_vr_capture");
 	printf("default resolution mode: '%s'\n", obs_data_get_string(defaults, "resolution"));
 	CHECK(strcmp(obs_data_get_string(defaults, "resolution"), "hmd") == 0, "default is not HMD res");
 	obs_data_release(defaults);

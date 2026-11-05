@@ -1,4 +1,4 @@
-// VR Capture - OpenXR API layer (picture only).
+// Archan VR Capture - OpenXR API layer (picture only).
 //
 // Sits between the game and any OpenXR runtime (VDXR, Pimax, SteamVR...).
 // PimaxHome is skipped (never sent to OBS). With Pimax quad views, view 0 is the wide left view.
@@ -35,7 +35,7 @@
 
 #include "../common/qvd_shared.h"
 
-#define LAYER_NAME "XR_APILAYER_VRCAPTURE_obs"
+#define LAYER_NAME "XR_APILAYER_ARCHAN_vr_capture"
 
 namespace {
 
@@ -57,7 +57,7 @@ void InitLogPath()
 		return;
 	PWSTR base = nullptr;
 	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) {
-		std::wstring dir = std::wstring(base) + L"\\VRCapture";
+		std::wstring dir = std::wstring(base) + L"\\ArchanVRCapture";
 		CreateDirectoryW(dir.c_str(), nullptr);
 		dir += L"\\logs";
 		CreateDirectoryW(dir.c_str(), nullptr);
