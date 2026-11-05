@@ -55,8 +55,14 @@ $copies = @(
     @($pluginSrcIni, (Join-Path $pluginDir "data\locale\en-US.ini"))
 )
 foreach ($c in $copies) {
+    $a = (Get-FileHash $c[0]).Hash
+    if ((Test-Path $c[1]) -and ((Get-FileHash $c[1]).Hash -eq $a)) {
+        # already identical: no copy (a running game may have the layer DLL loaded)
+        Write-Host "already identical (hash verified): $($c[1])  $a"
+        continue
+    }
     Copy-Item -Force $c[0] $c[1]
-    $a = (Get-FileHash $c[0]).Hash; $b = (Get-FileHash $c[1]).Hash
+    $b = (Get-FileHash $c[1]).Hash
     if ($a -ne $b) { throw "copy verify failed: $($c[1])" }
     Write-Host "copied + hash verified: $($c[1])  $b"
 }

@@ -34,7 +34,7 @@ set_target_properties(obs_frontend_import PROPERTIES IMPORTED_IMPLIB "${IMPLIBS}
 
 set(OBS_INCLUDES "${OBS_SRC}/libobs" "${OBS_SRC}/frontend/api" "${GENERATED}")
 
-add_library(archan-vr-capture MODULE obs-plugin/plugin.cpp)
+add_library(archan-vr-capture MODULE obs-plugin/plugin.cpp obs-plugin/stabilizer.h)
 target_include_directories(archan-vr-capture PRIVATE ${OBS_INCLUDES} "${DEPS}/openvr/headers")
 target_link_libraries(archan-vr-capture PRIVATE obs_import obs_frontend_import user32 d3d11)
 set_property(TARGET archan-vr-capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
@@ -48,6 +48,9 @@ add_custom_command(TARGET archan-vr-capture POST_BUILD
 add_executable(layer_mock_test tests/layer_mock_test.cpp)
 target_include_directories(layer_mock_test PRIVATE "${DEPS}/openxr-sdk/include")
 target_link_libraries(layer_mock_test PRIVATE d3d11 d3d12 dxgi)
+
+add_executable(stab_test tests/stab_test.cpp)
+add_executable(stab_replay tests/stab_replay.cpp)
 
 add_executable(plugin_render_test tests/plugin_render_test.cpp)
 target_include_directories(plugin_render_test PRIVATE ${OBS_INCLUDES})

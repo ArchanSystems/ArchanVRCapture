@@ -24,15 +24,21 @@
 #include <obs-frontend-api.h>
 #include <util/config-file.h>
 #include <util/dstr.h>
+#include <util/platform.h>
 
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <cmath>
+#include <iterator>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
 #include "../common/qvd_shared.h"
+#include "stabilizer.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("archan-vr-capture", "en-US")
@@ -44,6 +50,15 @@ namespace {
 // Recording resolution modes (source setting "resolution")
 #define MODE_HMD "hmd"         // automatic: left eye native 16:9 crop size (1:1 pixels)
 #define MODE_1080 "1920x1080"  // fixed 1920x1080
+
+// While OBS records, every new head pose of the shown picture is written to
+// %LOCALAPPDATA%\ArchanVRCapture\logs\poses-YYYYMMDD-HHMMSS.csv (to measure real head motion).
+struct PoseRecorder {
+	FILE *f = nullptr;
+	uint64_t lastSeq[3] = {0, 0, 0};
+	uint64_t rows = 0;
+	std::string path;
+};
 
 struct QvdSource {
 	obs_source_t *source = nullptr;
@@ -74,6 +89,52 @@ struct QvdSource {
 	// picture currently shown: 0 none, 1 OpenXR layer, 2 SteamVR mirror
 	volatile int picKind = 0;
 	volatile uint32_t picW = 0, picH = 0;
+
+	// head pose of the picture (for stabilization), per source of the picture
+	struct Pose {
+		bool valid = false, upKnown = false;
+		stab::Q q = {0, 0, 0, 1};
+		stab::V3 up = {0, 1, 0};
+		double tan[4] = {-1, 1, 1, -1}; // left right up down
+		int64_t tNs = 0;
+		uint64_t seq = 0; // +1 for every new frame's pose
+	};
+	Pose layerPose, mirrorPose;
+	uint32_t mirrorFrameIndex = 0;
+
+	// stabilization (look-ahead): the last 'delay' seconds of frames with their poses
+	struct BufFrame {
+		gs_texture_t *tex = nullptr;
+		bool inUse = false;
+		double t = 0; // seconds (the frame's pose time)
+		Pose pose;
+		uint32_t w = 0, h = 0, flags = 0;
+		gs_color_format fmt = GS_UNKNOWN;
+	};
+	std::mutex stabLock; // settings + status: UI thread vs render thread
+	stab::Settings stabSettings;
+	bool stabDirty = true;
+	char stabStatus[400] = "";
+	stab::LookAhead look;      // render thread only
+	std::vector<BufFrame> buf; // render thread only
+	uint64_t bufSeq = 0;
+	bool haveClock = false;
+	double clockOffset = 0; // game frame clock - OBS clock (s), slowly filtered
+	int bufKind = 0;
+	uint32_t bufWriter = 0, bufW = 0, bufH = 0;
+	gs_effect_t *stabEffect = nullptr;
+	bool stabEffectFailed = false;
+	bool stabLoggedNoPose = false;
+	bool stabLoggedStart = false;
+	PoseRecorder recorder; // render thread only
+	std::atomic<bool> removed{false}; // removed from OBS (audio sync goes back)
+	// cost measurement (render thread): this source's CPU time per render, logged every 10 s
+	struct Cost {
+		uint64_t windowNs = 0;
+		uint32_t renders = 0, plans = 0, totalFrames = 0, laggedFrames = 0;
+		double sumMs = 0, maxMs = 0, planSumMs = 0, planMaxMs = 0;
+	} cost;
+	uint64_t audioCheckNs = 0;         // tick thread
 };
 
 // ---------------------------------------------------------------- SteamVR mirror (OpenVR games)
@@ -94,6 +155,39 @@ struct MirrorState {
 	uint64_t gen = 0; // +1 whenever tex changes
 };
 MirrorState g_mirror;
+
+// OpenVR interfaces for the render thread (frame pose of the mirror picture). Every OpenVR call
+// is made under callLock. Lock order: graphics, then g_mirror.lock, then g_vr.callLock.
+struct VrShared {
+	std::mutex callLock;
+	vr::IVRSystem *sys = nullptr;
+	vr::IVRCompositor *comp = nullptr;
+	stab::Q eyeToHead = {0, 0, 0, 1}; // left eye orientation in the HMD
+	double tan[4] = {-1, 1, 1, -1};    // left eye FOV tangents: left right up down
+};
+VrShared g_vr;
+
+stab::Q RotationOf(const vr::HmdMatrix34_t &m)
+{
+	return stab::FromColumns({m.m[0][0], m.m[1][0], m.m[2][0]}, {m.m[0][1], m.m[1][1], m.m[2][1]},
+				 {m.m[0][2], m.m[1][2], m.m[2][2]});
+}
+
+// worker thread, under g_vr.callLock: what the mirror picture's pose needs besides the frame pose
+void VrReadEyeGeometry()
+{
+	g_vr.eyeToHead = RotationOf(g_vr.sys->GetEyeToHeadTransform(vr::Eye_Left));
+	float l = -1, r = 1, t = -1, b = 1;
+	g_vr.sys->GetProjectionRaw(vr::Eye_Left, &l, &r, &t, &b);
+	// The header does not state the sign convention of top/bottom; the image's top row is 'top':
+	// with y down (top < bottom) tan(up) = -top, with y up tan(up) = top.
+	g_vr.tan[0] = l;
+	g_vr.tan[1] = r;
+	g_vr.tan[2] = (t < b) ? -t : t;
+	g_vr.tan[3] = (t < b) ? -b : b;
+	LOG(LOG_INFO, "SteamVR left eye: projection raw l %.4f r %.4f t %.4f b %.4f -> tan up %.4f down %.4f", l, r, t, b,
+	    g_vr.tan[2], g_vr.tan[3]);
+}
 std::thread g_vrThread;
 std::atomic<bool> g_vrStop{false};
 HMODULE g_openvr = nullptr;
@@ -141,8 +235,10 @@ void MirrorDrop(vr::IVRCompositor *comp)
 	obs_enter_graphics();
 	{
 		std::lock_guard<std::mutex> l(g_mirror.lock);
-		if (g_mirror.srv && comp)
+		if (g_mirror.srv && comp) {
+			std::lock_guard<std::mutex> c(g_vr.callLock);
 			comp->ReleaseMirrorTextureD3D11(g_mirror.srv);
+		}
 		if (g_mirror.tex)
 			g_mirror.tex->Release();
 		g_mirror.srv = nullptr;
@@ -164,7 +260,10 @@ int MirrorGet(vr::IVRCompositor *comp)
 	ID3D11Device *dev = static_cast<ID3D11Device *>(gs_get_device_obj());
 	void *srv = nullptr;
 	if (dev) {
-		result = (int)comp->GetMirrorTextureD3D11(vr::Eye_Left, dev, &srv);
+		{
+			std::lock_guard<std::mutex> c(g_vr.callLock);
+			result = (int)comp->GetMirrorTextureD3D11(vr::Eye_Left, dev, &srv);
+		}
 		if (result == 0 && srv) {
 			ID3D11Resource *res = nullptr;
 			ID3D11Texture2D *t = nullptr;
@@ -187,6 +286,7 @@ int MirrorGet(vr::IVRCompositor *comp)
 				LOG(LOG_INFO, "SteamVR mirror left eye %ux%u dxgi format %d (mips %u, array %u, samples %u)",
 				    d.Width, d.Height, (int)d.Format, d.MipLevels, d.ArraySize, d.SampleDesc.Count);
 			} else {
+				std::lock_guard<std::mutex> c(g_vr.callLock);
 				comp->ReleaseMirrorTextureD3D11(srv);
 				result = -2;
 			}
@@ -209,6 +309,7 @@ void VrThread()
 		if (!connected && now >= nextTry) {
 			nextTry = now + 3000;
 			vr::EVRInitError e = vr::VRInitError_None;
+			std::unique_lock<std::mutex> c(g_vr.callLock);
 			vr_Init(&e, vr::VRApplication_Background, nullptr); // never starts SteamVR
 			if (e == vr::VRInitError_None) {
 				sys = static_cast<vr::IVRSystem *>(vr_GetInterface(vr::IVRSystem_Version, &e));
@@ -224,6 +325,9 @@ void VrThread()
 					lastInitErr = -999;
 					lastMirrorErr = -999;
 					nextMirrorTry = 0;
+					g_vr.sys = sys;
+					g_vr.comp = comp;
+					VrReadEyeGeometry();
 					LOG(LOG_INFO, "connected to SteamVR (background app, %s / %s)", vr::IVRSystem_Version,
 					    vr::IVRCompositor_Version);
 				}
@@ -235,13 +339,21 @@ void VrThread()
 		if (connected) {
 			vr::VREvent_t ev;
 			bool quit = false;
-			while (sys->PollNextEvent(&ev, sizeof(ev)))
-				if (ev.eventType == vr::VREvent_Quit)
-					quit = true;
+			{
+				std::lock_guard<std::mutex> c(g_vr.callLock);
+				while (sys->PollNextEvent(&ev, sizeof(ev)))
+					if (ev.eventType == vr::VREvent_Quit)
+						quit = true;
+			}
 			if (quit) {
 				LOG(LOG_INFO, "SteamVR is quitting - disconnecting");
 				MirrorDrop(comp);
-				vr_Shutdown();
+				{
+					std::lock_guard<std::mutex> c(g_vr.callLock);
+					g_vr.sys = nullptr;
+					g_vr.comp = nullptr;
+					vr_Shutdown();
+				}
 				sys = nullptr;
 				comp = nullptr;
 				connected = false;
@@ -265,7 +377,12 @@ void VrThread()
 	}
 	if (connected) {
 		MirrorDrop(comp);
-		vr_Shutdown();
+		{
+			std::lock_guard<std::mutex> c(g_vr.callLock);
+			g_vr.sys = nullptr;
+			g_vr.comp = nullptr;
+			vr_Shutdown();
+		}
 		LOG(LOG_INFO, "disconnected from SteamVR");
 	}
 }
@@ -341,6 +458,29 @@ bool CopyMirror(QvdSource *s)
 	ctx->CopySubresourceRegion(dst, 0, 0, 0, 0, g_mirror.tex, 0, nullptr);
 	ctx->Release();
 	s->mirrorFrame = true;
+
+	// Pose of that picture: the HMD pose SteamVR says the app rendered the latest frame with
+	// (Compositor_FrameTiming::m_HmdPose) times the left eye's offset. Which frame the mirror
+	// texture shows at this moment is not documented: NOT PROVEN to match exactly.
+	std::lock_guard<std::mutex> c(g_vr.callLock);
+	if (g_vr.comp) {
+		vr::Compositor_FrameTiming ft = {};
+		ft.m_nSize = sizeof(ft);
+		if (g_vr.comp->GetFrameTiming(&ft, 0) && ft.m_HmdPose.bPoseIsValid) {
+			if (!s->mirrorPose.valid || ft.m_nFrameIndex != s->mirrorFrameIndex) {
+				s->mirrorFrameIndex = ft.m_nFrameIndex;
+				QvdSource::Pose &p = s->mirrorPose;
+				p.q = stab::Mul(RotationOf(ft.m_HmdPose.mDeviceToAbsoluteTracking), g_vr.eyeToHead);
+				p.up = {0, 1, 0}; // SteamVR tracking universes are y-up
+				p.upKnown = true;
+				for (int i = 0; i < 4; i++)
+					p.tan[i] = g_vr.tan[i];
+				p.tNs = (int64_t)(ft.m_flSystemTimeInSeconds * 1e9);
+				p.valid = true;
+				p.seq++;
+			}
+		}
+	}
 	return true;
 }
 
@@ -478,6 +618,19 @@ void PollLayer(QvdSource *s)
 		if (fc != s->lastFrameCount) {
 			if (gs_texture_acquire_sync(s->shared, 0, 0) == 0) {
 				gs_copy_texture(s->copy, s->shared);
+				// the layer writes the pose while it holds this mutex: it belongs to the copied picture
+				QvdShared *m = s->shm;
+				QvdSource::Pose &p = s->layerPose;
+				p.valid = (m->poseFlags & QVD_POSE_VALID) != 0;
+				if (p.valid) {
+					p.q = {m->poseOrient[0], m->poseOrient[1], m->poseOrient[2], m->poseOrient[3]};
+					p.upKnown = (m->poseFlags & QVD_POSE_UP) != 0;
+					p.up = {m->up[0], m->up[1], m->up[2]};
+					for (int i = 0; i < 4; i++)
+						p.tan[i] = m->fovTan[i];
+					p.tNs = m->displayTimeNs;
+					p.seq++;
+				}
 				gs_texture_release_sync(s->shared, 0);
 				s->lastFrameCount = fc;
 				s->haveFrame = true;
@@ -516,6 +669,510 @@ void Poll(QvdSource *s)
 
 void KeepVideoSize(QvdSource *s);
 
+// ---------------------------------------------------------------- audio sync (user decision 2026-11-05)
+// While a VR source has stabilization on, every audio source's Sync Offset = its own offset + the
+// video delay (the largest delay of the VR sources that are on). Stabilization off or the VR source
+// removed: every audio source gets its own offset back. Own offset = what is shown minus the delay
+// the plugin added, so an offset the user types meanwhile is kept as theirs (+ the delay).
+// OBS saves the scene collection at exit while the delay is still applied, so the own offsets are
+// saved with it (module data) and taken back on load, only where the saved Sync Offset is still
+// exactly the one the plugin set.
+#define AUDIO_SAVE_KEY "archan_vr_capture_audio_sync"
+struct AudioSync {
+	std::mutex lock;                      // want + queued: any thread
+	std::map<const void *, int64_t> want; // per VR source: delay ns (only sources that are on)
+	bool queued = false;
+	// UI thread only:
+	struct Managed {
+		int64_t own = 0, applied = 0;
+		std::string name;
+	};
+	std::map<std::string, Managed> managed; // by source uuid
+	bool ready = false;                     // scene collection loaded (no frontend: from module load)
+};
+AudioSync g_audio;
+
+long long Ms(int64_t ns)
+{
+	return std::llround((double)ns / 1e6);
+}
+
+void AudioApplyTask(void *)
+{
+	int64_t d = 0;
+	{
+		std::lock_guard<std::mutex> l(g_audio.lock);
+		g_audio.queued = false;
+		for (const auto &w : g_audio.want)
+			d = std::max(d, w.second);
+	}
+	if (!g_audio.ready)
+		return;
+	struct Ctx {
+		int64_t d;
+		std::set<std::string> seen;
+	} ctx{d, {}};
+	obs_enum_sources(
+		[](void *p, obs_source_t *src) {
+			Ctx &c = *static_cast<Ctx *>(p);
+			if (!(obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO) || obs_source_removed(src))
+				return true;
+			const char *u = obs_source_get_uuid(src);
+			if (!u)
+				return true;
+			const std::string uuid = u;
+			const char *nm = obs_source_get_name(src);
+			const int64_t cur = obs_source_get_sync_offset(src);
+			auto it = g_audio.managed.find(uuid);
+			const int64_t own = it == g_audio.managed.end() ? cur : cur - (it->second.applied - it->second.own);
+			if (c.d > 0) {
+				c.seen.insert(uuid);
+				const int64_t target = own + c.d;
+				if (cur != target) {
+					obs_source_set_sync_offset(src, target);
+					LOG(LOG_INFO, "audio sync: '%s' %lld ms -> %lld ms (own %lld ms + video delay %lld ms)",
+					    nm ? nm : "", Ms(cur), Ms(obs_source_get_sync_offset(src)), Ms(own), Ms(c.d));
+				}
+				AudioSync::Managed &m = g_audio.managed[uuid];
+				m.own = own;
+				m.applied = obs_source_get_sync_offset(src);
+				m.name = nm ? nm : "";
+			} else if (it != g_audio.managed.end()) {
+				obs_source_set_sync_offset(src, own);
+				LOG(LOG_INFO, "audio sync: '%s' %lld ms -> %lld ms (own offset back)", nm ? nm : "", Ms(cur),
+				    Ms(obs_source_get_sync_offset(src)));
+				g_audio.managed.erase(it);
+			}
+			return true;
+		},
+		&ctx);
+	if (d > 0) {
+		for (auto it = g_audio.managed.begin(); it != g_audio.managed.end();)
+			it = ctx.seen.count(it->first) ? std::next(it) : g_audio.managed.erase(it); // source is gone
+	} else {
+		g_audio.managed.clear();
+	}
+}
+
+void AudioQueue()
+{
+	{
+		std::lock_guard<std::mutex> l(g_audio.lock);
+		if (g_audio.queued)
+			return;
+		g_audio.queued = true;
+	}
+	obs_queue_task(OBS_TASK_UI, AudioApplyTask, nullptr, false);
+}
+
+// key = the VR source; ns = its video delay, 0 = stabilization off / source removed
+void AudioWant(const void *key, int64_t ns)
+{
+	{
+		std::lock_guard<std::mutex> l(g_audio.lock);
+		if (ns > 0)
+			g_audio.want[key] = ns;
+		else
+			g_audio.want.erase(key);
+	}
+	AudioQueue();
+}
+
+// Scene collection save / load (UI thread). 'data' = this collection's module data.
+void AudioSaveLoad(obs_data_t *data, bool saving, void *)
+{
+	if (saving) {
+		obs_data_array_t *arr = obs_data_array_create();
+		for (const auto &m : g_audio.managed) {
+			obs_data_t *o = obs_data_create();
+			obs_data_set_string(o, "uuid", m.first.c_str());
+			obs_data_set_string(o, "name", m.second.name.c_str());
+			obs_data_set_int(o, "own", m.second.own);
+			obs_data_set_int(o, "applied", m.second.applied);
+			obs_data_array_push_back(arr, o);
+			obs_data_release(o);
+		}
+		obs_data_set_array(data, AUDIO_SAVE_KEY, arr);
+		obs_data_array_release(arr);
+		return;
+	}
+	g_audio.managed.clear();
+	obs_data_array_t *arr = obs_data_get_array(data, AUDIO_SAVE_KEY);
+	const size_t n = arr ? obs_data_array_count(arr) : 0;
+	for (size_t i = 0; i < n; i++) {
+		obs_data_t *o = obs_data_array_item(arr, i);
+		const char *uuid = obs_data_get_string(o, "uuid");
+		const int64_t own = obs_data_get_int(o, "own"), applied = obs_data_get_int(o, "applied");
+		obs_source_t *src = uuid && *uuid ? obs_get_source_by_uuid(uuid) : nullptr;
+		if (src) {
+			const int64_t cur = obs_source_get_sync_offset(src);
+			if (cur == applied) {
+				AudioSync::Managed &m = g_audio.managed[uuid];
+				m.own = own;
+				m.applied = applied;
+				m.name = obs_source_get_name(src) ? obs_source_get_name(src) : "";
+				LOG(LOG_INFO, "audio sync: '%s' was saved with %lld ms = own %lld ms + video delay", m.name.c_str(),
+				    Ms(cur), Ms(own));
+			} else {
+				LOG(LOG_INFO, "audio sync: '%s' is %lld ms, not the %lld ms the plugin set - kept as the own offset",
+				    obs_source_get_name(src) ? obs_source_get_name(src) : "", Ms(cur), Ms(applied));
+			}
+			obs_source_release(src);
+		}
+		obs_data_release(o);
+	}
+	obs_data_array_release(arr);
+	AudioQueue();
+}
+
+void AudioFrontendEvent(enum obs_frontend_event e)
+{
+	switch (e) {
+	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
+		g_audio.ready = true;
+		AudioQueue();
+		break;
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
+	case OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN:
+	case OBS_FRONTEND_EVENT_EXIT:
+		g_audio.ready = false; // the collection was saved with the own offsets recorded
+		break;
+	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP:
+		g_audio.ready = false;
+		g_audio.managed.clear(); // its sources are gone
+		break;
+	default: break;
+	}
+}
+
+// ---------------------------------------------------------------- stabilization
+// Recording/streaming state from frontend events (cheap to read from the render thread).
+std::atomic<bool> g_recActive{false}, g_streamActive{false}, g_replayActive{false}, g_vcamActive{false};
+bool OutputsRunning()
+{
+	return g_recActive || g_streamActive || g_replayActive || g_vcamActive;
+}
+void OnFrontendEvent(enum obs_frontend_event e, void *)
+{
+	switch (e) {
+	case OBS_FRONTEND_EVENT_RECORDING_STARTED: g_recActive = true; break;
+	case OBS_FRONTEND_EVENT_RECORDING_STOPPED: g_recActive = false; break;
+	case OBS_FRONTEND_EVENT_STREAMING_STARTED: g_streamActive = true; break;
+	case OBS_FRONTEND_EVENT_STREAMING_STOPPED: g_streamActive = false; break;
+	case OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED: g_replayActive = true; break;
+	case OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED: g_replayActive = false; break;
+	case OBS_FRONTEND_EVENT_VIRTUALCAM_STARTED: g_vcamActive = true; break;
+	case OBS_FRONTEND_EVENT_VIRTUALCAM_STOPPED: g_vcamActive = false; break;
+	default: break;
+	}
+	AudioFrontendEvent(e);
+}
+
+void PoseRecord(QvdSource *s, PoseRecorder &r)
+{
+	if (!g_recActive) {
+		if (r.f) {
+			fclose(r.f);
+			r.f = nullptr;
+			LOG(LOG_INFO, "head motion recorder: %llu poses written to %s", (unsigned long long)r.rows, r.path.c_str());
+		}
+		return;
+	}
+	if (s->picKind == 0)
+		return;
+	const QvdSource::Pose &p = s->picKind == 1 ? s->layerPose : s->mirrorPose;
+	if (!p.valid || p.seq == r.lastSeq[s->picKind])
+		return;
+	r.lastSeq[s->picKind] = p.seq;
+	if (!r.f) {
+		char dir[MAX_PATH] = {};
+		if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH))
+			return;
+		std::string d = std::string(dir) + "\\ArchanVRCapture";
+		CreateDirectoryA(d.c_str(), nullptr);
+		d += "\\logs";
+		CreateDirectoryA(d.c_str(), nullptr);
+		SYSTEMTIME t;
+		GetLocalTime(&t);
+		char name[64];
+		snprintf(name, sizeof(name), "\\poses-%04d%02d%02d-%02d%02d%02d.csv", t.wYear, t.wMonth, t.wDay, t.wHour,
+			 t.wMinute, t.wSecond);
+		r.path = d + name;
+		r.f = fopen(r.path.c_str(), "w");
+		r.rows = 0;
+		if (!r.f) {
+			LOG(LOG_WARNING, "head motion recorder: cannot write %s", r.path.c_str());
+			return;
+		}
+		fprintf(r.f, "obs_time_ns,pose_time_ns,source,qx,qy,qz,qw,tan_left,tan_right,tan_up,tan_down,up_x,up_y,"
+			     "up_z,up_known,eye_w,eye_h\n");
+		LOG(LOG_INFO, "head motion recorder: writing %s", r.path.c_str());
+	}
+	fprintf(r.f, "%llu,%lld,%s,%.9f,%.9f,%.9f,%.9f,%.7f,%.7f,%.7f,%.7f,%.6f,%.6f,%.6f,%d,%u,%u\n",
+		(unsigned long long)os_gettime_ns(), (long long)p.tNs, s->picKind == 1 ? "openxr" : "steamvr", p.q.x, p.q.y,
+		p.q.z, p.q.w, p.tan[0], p.tan[1], p.tan[2], p.tan[3], p.up.x, p.up.y, p.up.z, p.upKnown ? 1 : 0, s->picW,
+		s->picH);
+	r.rows++;
+}
+
+
+// Output pixel (u,v) -> eye image texture coordinates through the homography rows h0..h2.
+const char *kStabEffect = R"(
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 h0;
+uniform float4 h1;
+uniform float4 h2;
+
+sampler_state linearSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSStab(VertData v_in) : TARGET
+{
+	float3 p = float3(v_in.uv, 1.0);
+	float3 q = float3(dot(h0.xyz, p), dot(h1.xyz, p), dot(h2.xyz, p));
+	return image.Sample(linearSampler, q.xy / max(q.z, 0.000001));
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSStab(v_in);
+	}
+}
+)";
+
+void SetStabStatus(QvdSource *s, const char *fmt, ...)
+{
+	char buf[400];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	std::lock_guard<std::mutex> l(s->stabLock);
+	strncpy_s(s->stabStatus, buf, _TRUNCATE);
+}
+
+void FreeBuffer(QvdSource *s) // graphics context
+{
+	for (QvdSource::BufFrame &b : s->buf)
+		if (b.tex)
+			gs_texture_destroy(b.tex);
+	s->buf.clear();
+}
+
+struct DrawPick {
+	gs_texture_t *tex = nullptr;
+	uint32_t flags = 0;
+	stab::Mat3 h;
+};
+
+// Render thread (graphics context). Buffers the newest frame with its pose and picks the frame
+// to show: the one 'delay' seconds old, re-projected to the look-ahead camera. false = show the
+// newest frame plainly (stabilization off / no head pose).
+bool StabPick(QvdSource *s, gs_texture_t *latest, uint32_t latestFlags, DrawPick *out)
+{
+	stab::Settings st;
+	bool dirty;
+	{
+		std::lock_guard<std::mutex> l(s->stabLock);
+		st = s->stabSettings;
+		dirty = s->stabDirty;
+		s->stabDirty = false;
+	}
+	if (dirty)
+		s->look.Configure(st);
+	if (!st.enable) {
+		if (!s->buf.empty())
+			FreeBuffer(s);
+		SetStabStatus(s, "%s", obs_module_text("Stab.Status.Off"));
+		return false;
+	}
+	const QvdSource::Pose &p = s->picKind == 1 ? s->layerPose : s->mirrorPose;
+	if (!p.valid) {
+		if (!s->stabLoggedNoPose) {
+			LOG(LOG_INFO, "stabilization: this picture has no head pose - shown without stabilization");
+			s->stabLoggedNoPose = true;
+		}
+		if (!s->buf.empty())
+			FreeBuffer(s);
+		SetStabStatus(s, "%s", obs_module_text("Stab.Status.NoPose"));
+		return false;
+	}
+	s->stabLoggedNoPose = false;
+
+	// another game / source / eye size: start over
+	const uint32_t writer = s->picKind == 1 ? s->writerPid : 0;
+	if (s->picKind != s->bufKind || writer != s->bufWriter || s->picW != s->bufW || s->picH != s->bufH) {
+		FreeBuffer(s);
+		s->look = stab::LookAhead();
+		s->haveClock = false;
+		s->look.Configure(st);
+		s->bufKind = s->picKind;
+		s->bufWriter = writer;
+		s->bufW = s->picW;
+		s->bufH = s->picH;
+	}
+
+	// buffer the newest frame
+	if (p.seq != s->bufSeq) {
+		s->bufSeq = p.seq;
+		const double t = (double)p.tNs * 1e-9;
+		s->look.AddPose(t, p.q, p.up, p.upKnown);
+		const double off = t - (double)os_gettime_ns() * 1e-9;
+		if (!s->haveClock || std::fabs(off - s->clockOffset) > 1.0) {
+			s->clockOffset = off; // first frame, or the game clock jumped (new session / stale frame)
+			s->haveClock = true;
+		} else {
+			s->clockOffset += (off - s->clockOffset) * 0.02;
+		}
+		const gs_color_format fmt = gs_texture_get_color_format(latest);
+		QvdSource::BufFrame *slot = nullptr;
+		for (QvdSource::BufFrame &b : s->buf)
+			if (!b.inUse && b.tex && b.w == s->picW && b.h == s->picH && b.fmt == fmt) {
+				slot = &b;
+				break;
+			}
+		if (!slot) {
+			s->buf.push_back(QvdSource::BufFrame());
+			slot = &s->buf.back();
+			slot->tex = gs_texture_create(s->picW, s->picH, fmt, 1, nullptr, 0);
+			slot->w = s->picW;
+			slot->h = s->picH;
+			slot->fmt = fmt;
+		}
+		if (slot->tex) {
+			gs_copy_texture(slot->tex, latest);
+			slot->inUse = true;
+			slot->t = t;
+			slot->pose = p;
+			slot->flags = latestFlags;
+		}
+	}
+
+	// output time T on the game frame clock: OBS render time mapped with a slowly filtered offset,
+	// minus the delay. Using the even OBS render time (not the jittery capture time of each frame)
+	// keeps static scenery smooth.
+	// OBS's own time of the frame being rendered (even steps, same clock as os_gettime_ns); a render
+	// of the same frame again gets the same time.
+	const uint64_t frameNs = obs_get_video_frame_time();
+	const double now = (double)(frameNs ? frameNs : os_gettime_ns()) * 1e-9;
+	const double T = now + s->clockOffset - st.delay;
+	struct obs_video_info ovi;
+	if (obs_get_video_info(&ovi) && ovi.fps_den)
+		s->look.SetFrameRate((double)ovi.fps_num / ovi.fps_den);
+
+	// free frames no longer needed (also stale frames from an earlier session)
+	const double latestT = s->look.Latest();
+	size_t inUse = 0;
+	for (QvdSource::BufFrame &b : s->buf) {
+		if (b.inUse && (b.t < T - 0.5 || b.t > latestT))
+			b.inUse = false;
+		inUse += b.inUse;
+	}
+	// drop unused textures beyond what the delay needs (+ a few spare)
+	size_t spare = 0;
+	for (size_t i = 0; i < s->buf.size();) {
+		if (!s->buf[i].inUse && ++spare > 4) {
+			if (s->buf[i].tex)
+				gs_texture_destroy(s->buf[i].tex);
+			s->buf.erase(s->buf.begin() + (ptrdiff_t)i);
+		} else {
+			i++;
+		}
+	}
+
+	// Delay buffer still filling: the frame nearest to T is the oldest one; it is shown unstabilized
+	// (zoomed like the stabilized picture), so the video is 'delay' behind from the start, the same
+	// as the audio sync offset.
+	const bool ready = s->look.Ready(T);
+	if (!ready) {
+		SetStabStatus(s, "%s", obs_module_text("Stab.Status.Filling"));
+		s->stabLoggedStart = false;
+	}
+	// frame to show: the one nearest to T
+	const QvdSource::BufFrame *pick = nullptr;
+	for (const QvdSource::BufFrame &b : s->buf)
+		if (b.inUse && (!pick || std::fabs(b.t - T) < std::fabs(pick->t - T)))
+			pick = &b;
+	if (!pick)
+		return false;
+
+	stab::Image img;
+	const QvdRect c = qvd_center_crop_16x9(pick->w, pick->h);
+	img.W = pick->w;
+	img.H = pick->h;
+	img.cropX = c.x;
+	img.cropY = c.y;
+	img.cropW = c.w;
+	img.cropH = c.h;
+	img.tl = pick->pose.tan[0];
+	img.tr = pick->pose.tan[1];
+	img.tu = pick->pose.tan[2];
+	img.td = pick->pose.tan[3];
+	const stab::Q head = stab::NormalizeQ(pick->pose.q);
+	if (!ready) {
+		out->tex = pick->tex;
+		out->flags = pick->flags;
+		out->h = stab::Homography(img, head, head, s->look.ZoomK());
+		return true;
+	}
+	const uint64_t p0 = os_gettime_ns();
+	const stab::Q cam = s->look.Camera(img, T, head);
+	const double planMs = (double)(os_gettime_ns() - p0) * 1e-6;
+	s->cost.plans++;
+	s->cost.planSumMs += planMs;
+	s->cost.planMaxMs = std::max(s->cost.planMaxMs, planMs);
+	if (!s->stabLoggedStart) {
+		LOG(LOG_INFO,
+		    "stabilization running: output time %.3f s, shown frame %.3f s, newest frame %.3f s (video %.3f s behind the "
+		    "newest frame; setting %.2f s), crop %.1f %%, %zu frames buffered",
+		    T, pick->t, latestT, latestT - pick->t, st.delay, st.crop, inUse);
+		s->stabLoggedStart = true;
+	}
+	out->tex = pick->tex;
+	out->flags = pick->flags;
+	out->h = stab::Homography(img, head, cam, s->look.ZoomK());
+
+	const double mb = (double)inUse * pick->w * pick->h * 4.0 / (1024.0 * 1024.0);
+	SetStabStatus(s, obs_module_text("Stab.Status.On"), st.crop, st.delay, (int)std::lround(st.delay * 1000.0),
+		      (unsigned)inUse, mb);
+	return true;
+}
+
+bool EnsureStabEffect(QvdSource *s)
+{
+	if (s->stabEffect || s->stabEffectFailed)
+		return s->stabEffect != nullptr;
+	char *err = nullptr;
+	s->stabEffect = gs_effect_create(kStabEffect, "archan_vr_capture_stabilize.effect", &err);
+	if (!s->stabEffect) {
+		LOG(LOG_WARNING, "stabilization shader failed: %s - shown without stabilization", err ? err : "?");
+		s->stabEffectFailed = true;
+	}
+	bfree(err);
+	return s->stabEffect != nullptr;
+}
+
 // ---------------------------------------------------------------- source callbacks
 const char *qvd_get_name(void *)
 {
@@ -532,25 +1189,75 @@ void qvd_update(void *data, obs_data_t *settings)
 	s->modeHmd = !is1080;
 	s->lastSizeRequest = 0; // act on the new choice right away
 	LOG(LOG_INFO, "recording resolution mode: %s", s->modeHmd ? "HMD res (automatic)" : "1920x1080");
+
+	stab::Settings st;
+	st.enable = obs_data_get_bool(settings, "stab_enable");
+	st.smooth = (double)obs_data_get_int(settings, "stab_smooth");
+	st.horizon = obs_data_get_bool(settings, "stab_horizon");
+	st.crop = obs_data_get_double(settings, "stab_crop");
+	st.delay = obs_data_get_double(settings, "stab_delay");
+	{
+		std::lock_guard<std::mutex> l(s->stabLock);
+		s->stabSettings = st;
+		s->stabDirty = true;
+	}
+	AudioWant(s, st.enable && !s->removed ? (int64_t)std::llround(st.delay * 1e9) : 0);
+	LOG(LOG_INFO, "stabilization: %s, smoothness %.0f, keep horizon level %s, crop %.1f %%, video delay %.2f s",
+	    st.enable ? "on" : "off", st.smooth, st.horizon ? "yes" : "no", st.crop, st.delay);
+}
+
+void qvd_removed(void *data, calldata_t *)
+{
+	QvdSource *s = static_cast<QvdSource *>(data);
+	s->removed = true;
+	AudioWant(s, 0);
 }
 
 void *qvd_create(obs_data_t *settings, obs_source_t *source)
 {
 	QvdSource *s = new QvdSource();
 	s->source = source;
+	signal_handler_connect(obs_source_get_signal_handler(source), "remove", qvd_removed, s);
 	qvd_update(s, settings);
 	return s;
+}
+
+// once a second while stabilization is on: audio sources added meanwhile / offsets typed by the user
+void qvd_video_tick(void *data, float)
+{
+	QvdSource *s = static_cast<QvdSource *>(data);
+	bool on;
+	{
+		std::lock_guard<std::mutex> l(s->stabLock);
+		on = s->stabSettings.enable;
+	}
+	const uint64_t now = os_gettime_ns();
+	if (on && !s->removed && now - s->audioCheckNs >= 1000000000ull) {
+		s->audioCheckNs = now;
+		AudioQueue();
+	}
 }
 
 void qvd_destroy(void *data)
 {
 	QvdSource *s = static_cast<QvdSource *>(data);
+	signal_handler_disconnect(obs_source_get_signal_handler(s->source), "remove", qvd_removed, s);
+	AudioWant(s, 0);
 	obs_enter_graphics();
 	CloseTextures(s);
 	if (s->mirrorCopy)
 		gs_texture_destroy(s->mirrorCopy);
 	s->mirrorCopy = nullptr;
+	if (s->stabEffect)
+		gs_effect_destroy(s->stabEffect);
+	s->stabEffect = nullptr;
+	FreeBuffer(s);
 	obs_leave_graphics();
+	if (s->recorder.f) {
+		fclose(s->recorder.f);
+		LOG(LOG_INFO, "head motion recorder: %llu poses written to %s", (unsigned long long)s->recorder.rows,
+		    s->recorder.path.c_str());
+	}
 	CloseShm(s);
 	delete s;
 }
@@ -567,18 +1274,69 @@ uint32_t qvd_get_height(void *)
 	return obs_get_video_info(&ovi) ? ovi.base_height : 1080;
 }
 
+void qvd_video_render_inner(QvdSource *s);
+
+// Every 10 s while a picture is shown: this source's CPU time on OBS's render thread, the planner's
+// share, and OBS's own average frame render time and lagged frames.
+void CostAccount(QvdSource *s, double ms)
+{
+	QvdSource::Cost &c = s->cost;
+	const uint64_t now = os_gettime_ns();
+	if (!c.windowNs || s->picKind == 0) {
+		c = QvdSource::Cost();
+		c.windowNs = now;
+		c.totalFrames = obs_get_total_frames();
+		c.laggedFrames = obs_get_lagged_frames();
+		return;
+	}
+	c.renders++;
+	c.sumMs += ms;
+	c.maxMs = std::max(c.maxMs, ms);
+	const double secs = (double)(now - c.windowNs) * 1e-9;
+	if (secs < 10.0)
+		return;
+	const uint32_t total = obs_get_total_frames(), lagged = obs_get_lagged_frames();
+	LOG(LOG_INFO,
+	    "cost (last %.0f s): this source on OBS's render thread avg %.2f ms, max %.2f ms per frame (%u renders); "
+	    "stabilization planner avg %.2f ms, max %.2f ms (%u plans); OBS frame render avg %.2f ms, lagged frames %u of %u",
+	    secs, c.renders ? c.sumMs / c.renders : 0.0, c.maxMs, c.renders, c.plans ? c.planSumMs / c.plans : 0.0,
+	    c.planMaxMs, c.plans, (double)obs_get_average_frame_time_ns() * 1e-6, lagged - c.laggedFrames,
+	    total - c.totalFrames);
+	c = QvdSource::Cost();
+	c.windowNs = now;
+	c.totalFrames = total;
+	c.laggedFrames = lagged;
+}
+
 void qvd_video_render(void *data, gs_effect_t *)
 {
 	QvdSource *s = static_cast<QvdSource *>(data);
+	const uint64_t t0 = os_gettime_ns();
+	qvd_video_render_inner(s);
+	CostAccount(s, (double)(os_gettime_ns() - t0) * 1e-6);
+}
+
+void qvd_video_render_inner(QvdSource *s)
+{
 	Poll(s);
+	PoseRecord(s, s->recorder);
 	if (s->picKind == 0)
 		return;
 	gs_texture_t *pic = s->picKind == 1 ? s->copy : s->mirrorCopy;
-	const uint32_t picFlags = s->picKind == 1 ? s->flags : s->mirrorFlags;
+	uint32_t picFlags = s->picKind == 1 ? s->flags : s->mirrorFlags;
 	KeepVideoSize(s);
 
 	const QvdRect c = qvd_center_crop_16x9(s->picW, s->picH);
 	const float cx = (float)qvd_get_width(s), cy = (float)qvd_get_height(s);
+
+	// stabilization: draw the delayed frame through the look-ahead camera
+	DrawPick pick;
+	const bool stabilized = StabPick(s, pic, picFlags, &pick) && EnsureStabEffect(s);
+	const stab::Mat3 &h = pick.h;
+	if (stabilized) {
+		pic = pick.tex;
+		picFlags = pick.flags;
+	}
 
 	// Colour: 8-bit swapchains hold display-ready (sRGB-encoded) bytes -> show bytes as they are.
 	// Float swapchains hold linear light -> encode to sRGB on output.
@@ -586,7 +1344,7 @@ void qvd_video_render(void *data, gs_effect_t *)
 	const bool hasSrgbView = f == GS_RGBA || f == GS_BGRA || f == GS_BGRX;
 	const bool linear = (picFlags & QVD_FLAG_LINEAR_FLOAT) != 0;
 
-	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_effect_t *effect = stabilized ? s->stabEffect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
 	const bool prevSrgb = gs_framebuffer_srgb_enabled();
 	if (linear) {
@@ -600,11 +1358,22 @@ void qvd_video_render(void *data, gs_effect_t *)
 		gs_effect_set_texture(image, pic);
 	}
 
-	gs_matrix_push();
-	gs_matrix_scale3f(cx / (float)c.w, cy / (float)c.h, 1.0f);
-	while (gs_effect_loop(effect, "Draw"))
-		gs_draw_sprite_subregion(pic, 0, c.x, c.y, c.w, c.h);
-	gs_matrix_pop();
+	if (stabilized) {
+		const char *names[3] = {"h0", "h1", "h2"};
+		for (int i = 0; i < 3; i++) {
+			struct vec4 row;
+			vec4_set(&row, (float)h.m[i][0], (float)h.m[i][1], (float)h.m[i][2], 0.0f);
+			gs_effect_set_vec4(gs_effect_get_param_by_name(effect, names[i]), &row);
+		}
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite(pic, 0, (uint32_t)cx, (uint32_t)cy);
+	} else {
+		gs_matrix_push();
+		gs_matrix_scale3f(cx / (float)c.w, cy / (float)c.h, 1.0f);
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite_subregion(pic, 0, c.x, c.y, c.w, c.h);
+		gs_matrix_pop();
+	}
 
 	gs_enable_framebuffer_srgb(prevSrgb);
 }
@@ -710,12 +1479,36 @@ obs_properties_t *qvd_get_properties(void *data)
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(list, obs_module_text("Mode.Hmd"), MODE_HMD);
 	obs_property_list_add_string(list, obs_module_text("Mode.1080"), MODE_1080);
+
+	// stabilization: the group's checkbox is On / Off
+	obs_properties_t *sp = obs_properties_create();
+	char stabStatus[400] = "";
+	if (s) {
+		std::lock_guard<std::mutex> l(s->stabLock);
+		strncpy_s(stabStatus, s->stabStatus, _TRUNCATE);
+	}
+	if (stabStatus[0]) {
+		obs_property_t *t = obs_properties_add_text(sp, "stab_status", stabStatus, OBS_TEXT_INFO);
+		obs_property_text_set_info_word_wrap(t, true);
+	}
+	obs_properties_add_int_slider(sp, "stab_smooth", obs_module_text("Stab.Smooth"), 0, 100, 1);
+	obs_properties_add_bool(sp, "stab_horizon", obs_module_text("Stab.Horizon"));
+	obs_property_t *crop = obs_properties_add_float_slider(sp, "stab_crop", obs_module_text("Stab.Crop"), 1.0, 40.0, 0.5);
+	obs_property_float_set_suffix(crop, " %");
+	obs_property_t *delay = obs_properties_add_float_slider(sp, "stab_delay", obs_module_text("Stab.Delay"), 0.1, 2.0, 0.05);
+	obs_property_float_set_suffix(delay, " s");
+	obs_properties_add_group(props, "stab_enable", obs_module_text("Stab.Group"), OBS_GROUP_CHECKABLE, sp);
 	return props;
 }
 
 void qvd_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "resolution", MODE_HMD);
+	obs_data_set_default_bool(settings, "stab_enable", true);
+	obs_data_set_default_int(settings, "stab_smooth", 50);
+	obs_data_set_default_bool(settings, "stab_horizon", false);
+	obs_data_set_default_double(settings, "stab_crop", 15.0);  // user decision 2026-11-05 after VD/Q3 test
+	obs_data_set_default_double(settings, "stab_delay", 0.20); // user decision 2026-11-05 after VD/Q3 test
 }
 
 } // namespace
@@ -732,6 +1525,7 @@ bool obs_module_load(void)
 	info.get_width = qvd_get_width;
 	info.get_height = qvd_get_height;
 	info.video_render = qvd_video_render;
+	info.video_tick = qvd_video_tick;
 	info.get_properties = qvd_get_properties;
 	info.get_defaults = qvd_get_defaults;
 	info.update = qvd_update;
@@ -752,14 +1546,31 @@ bool obs_module_load(void)
 		g_vrStop = false;
 		g_vrThread = std::thread(VrThread);
 	}
+	obs_frontend_add_event_callback(OnFrontendEvent, nullptr);
+	obs_frontend_add_save_callback(AudioSaveLoad, nullptr);
+	// without the OBS frontend (tests) there is no scene collection to wait for
+	g_audio.ready = obs_frontend_get_main_window() == nullptr;
+	char testRec[8] = "";
+	if (GetEnvironmentVariableA("ARCHAN_VRCAPTURE_TEST_RECORDING", testRec, sizeof(testRec)) && testRec[0] == '1') {
+		g_recActive = true; // tests only: behave as if OBS were recording
+		LOG(LOG_INFO, "test mode: acting as if OBS is recording");
+	}
 	LOG(LOG_INFO,
 	    "loaded (source 'archan_vr_capture', old ids 'quest_vd_vr_picture' 'vr_capture' kept; SteamVR mirror %s)",
 	    g_openvr ? "on" : "off");
 	return true;
 }
 
+// tests only: the scene collection save / load step of the audio sync (no OBS frontend in tests)
+extern "C" __declspec(dllexport) void archan_vr_capture_test_audio_saveload(obs_data_t *data, bool saving)
+{
+	AudioSaveLoad(data, saving, nullptr);
+}
+
 void obs_module_unload(void)
 {
+	obs_frontend_remove_event_callback(OnFrontendEvent, nullptr);
+	obs_frontend_remove_save_callback(AudioSaveLoad, nullptr);
 	if (g_vrThread.joinable()) {
 		g_vrStop = true;
 		g_vrThread.join();

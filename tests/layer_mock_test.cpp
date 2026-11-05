@@ -22,9 +22,11 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../common/qvd_shared.h"
@@ -34,6 +36,14 @@ static const uint32_t TEX_W = 2300, TEX_H = 2400; // swapchain texture
 static const int32_t RECT_X = 100, RECT_Y = 50;   // left view imageRect offset
 static const uint32_t RECT_W = 2064, RECT_H = 2208;
 static const uint32_t NUM_IMAGES = 3, FRAMES = 10;
+
+// pose the mock game sends with the left view (checked by the reader)
+static const XrQuaternionf POSE_Q = {0.0f, 0.38268343f, 0.0f, 0.92387953f}; // 45 deg yaw
+static const XrFovf POSE_FOV = {-0.80f, 0.70f, 0.75f, -0.85f};
+static const XrQuaternionf SPACE_Q = {0.25881905f, 0.0f, 0.0f, 0.96592583f}; // LOCAL space rotated 30 deg about x
+static const XrTime DISPLAY_TIME = 7000000000ll;
+// world up in that space = rotate (0,1,0) by -30 deg about x = (0, cos 30, -sin 30)
+static const float UP_EXPECTED[3] = {0.0f, 0.86602540f, -0.5f};
 
 static uint32_t Expected(uint32_t imageIndex, uint32_t slice, uint32_t x, uint32_t y)
 {
@@ -51,6 +61,7 @@ static ID3D12Resource *g_images12[NUM_IMAGES] = {};
 static bool g_useD3D12 = false;
 static uint32_t g_nextAcquire = 0;
 static int g_endFrames = 0;
+static bool g_costTest = false; // --cost: also check the layer's cost log
 
 static XrResult XRAPI_CALL mock_GetInstanceProperties(XrInstance, XrInstanceProperties *p)
 {
@@ -99,12 +110,19 @@ static XrResult XRAPI_CALL mock_EndFrame(XrSession, const XrFrameEndInfo *)
 	g_endFrames++;
 	return XR_SUCCESS;
 }
+static XrResult XRAPI_CALL mock_CreateReferenceSpace(XrSession, const XrReferenceSpaceCreateInfo *, XrSpace *s)
+{
+	*s = (XrSpace)(uintptr_t)0x5BACE;
+	return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL mock_DestroySpace(XrSpace) { return XR_SUCCESS; }
 
 static XrResult XRAPI_CALL mock_GetInstanceProcAddr(XrInstance, const char *name, PFN_xrVoidFunction *fn)
 {
 #define M(x) if (strcmp(name, #x) == 0) { *fn = (PFN_xrVoidFunction)mock_##x; return XR_SUCCESS; }
 	M(GetInstanceProperties) M(DestroyInstance) M(CreateSession) M(DestroySession) M(CreateSwapchain)
 	M(DestroySwapchain) M(EnumerateSwapchainImages) M(AcquireSwapchainImage) M(ReleaseSwapchainImage) M(EndFrame)
+	M(CreateReferenceSpace) M(DestroySpace)
 #undef M
 	*fn = nullptr;
 	return XR_ERROR_FUNCTION_UNSUPPORTED;
@@ -171,6 +189,22 @@ static int RunReader()
 	CHECK(shm->swapchainFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, "swapchain format");
 	CHECK(shm->flags == QVD_FLAG_SRGB_FORMAT, "flags %u", shm->flags);
 	CHECK(shm->frameCount == FRAMES, "frameCount %llu (expected %u)", (unsigned long long)shm->frameCount, FRAMES);
+
+	// v2 pose for stabilization
+	printf("reader: pose flags %u, q %.6f %.6f %.6f %.6f, fov tan %.6f %.6f %.6f %.6f, up %.6f %.6f %.6f, time %lld\n",
+	       shm->poseFlags, shm->poseOrient[0], shm->poseOrient[1], shm->poseOrient[2], shm->poseOrient[3],
+	       shm->fovTan[0], shm->fovTan[1], shm->fovTan[2], shm->fovTan[3], shm->up[0], shm->up[1], shm->up[2],
+	       (long long)shm->displayTimeNs);
+	CHECK(shm->poseFlags == (QVD_POSE_VALID | QVD_POSE_UP), "pose flags %u", shm->poseFlags);
+	const float eq[4] = {POSE_Q.x, POSE_Q.y, POSE_Q.z, POSE_Q.w};
+	const float ef[4] = {tanf(POSE_FOV.angleLeft), tanf(POSE_FOV.angleRight), tanf(POSE_FOV.angleUp), tanf(POSE_FOV.angleDown)};
+	for (int i = 0; i < 4; i++) {
+		CHECK(fabsf(shm->poseOrient[i] - eq[i]) < 1e-6f, "pose orientation [%d]", i);
+		CHECK(fabsf(shm->fovTan[i] - ef[i]) < 1e-6f, "fov tangent [%d]", i);
+	}
+	for (int i = 0; i < 3; i++)
+		CHECK(fabsf(shm->up[i] - UP_EXPECTED[i]) < 1e-5f, "up [%d] %.6f expected %.6f", i, shm->up[i], UP_EXPECTED[i]);
+	CHECK(shm->displayTimeNs == DISPLAY_TIME, "display time");
 
 	ID3D11Device *dev = nullptr;
 	ID3D11DeviceContext *ctx = nullptr;
@@ -309,6 +343,7 @@ static int RunWriter(const char *exePath, const char *layerPath)
 	GET(xrDestroySwapchain, DestroySwapchain)
 	GET(xrDestroySession, DestroySession)
 	GET(xrDestroyInstance, DestroyInstance)
+	GET(xrCreateReferenceSpace, CreateReferenceSpace)
 #undef GET
 
 	XrGraphicsBindingD3D11KHR gb = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
@@ -316,6 +351,11 @@ static int RunWriter(const char *exePath, const char *layerPath)
 	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO, &gb};
 	XrSession session;
 	CHECK(CreateSession(inst, &sci, &session) == XR_SUCCESS, "session");
+	XrReferenceSpaceCreateInfo rci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+	rci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	rci.poseInReferenceSpace = {SPACE_Q, {0, 0, 0}};
+	XrSpace space = XR_NULL_HANDLE;
+	CHECK(CreateReferenceSpace(session, &rci, &space) == XR_SUCCESS, "reference space");
 
 	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	swci.format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
@@ -345,12 +385,16 @@ static int RunWriter(const char *exePath, const char *layerPath)
 			views[v].subImage.swapchain = sc;
 			views[v].subImage.imageRect = {{RECT_X, RECT_Y}, {(int32_t)RECT_W, (int32_t)RECT_H}};
 			views[v].subImage.imageArrayIndex = v;
+			views[v].pose = {POSE_Q, {0, 0, 0}};
+			views[v].fov = POSE_FOV;
 		}
 		XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 		proj.viewCount = 2;
+		proj.space = space;
 		proj.views = views;
 		const XrCompositionLayerBaseHeader *layers[] = {(const XrCompositionLayerBaseHeader *)&proj};
 		XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
+		fei.displayTime = DISPLAY_TIME;
 		fei.layerCount = 1;
 		fei.layers = layers;
 		return EndFrame(session, &fei);
@@ -420,6 +464,139 @@ static int RunWriter(const char *exePath, const char *layerPath)
 	      "no take-over after owner ended (pid %u handle 0x%X %ux%u frames %llu)", view->writerPid,
 	      view->sharedHandle, view->width, view->height, (unsigned long long)view->frameCount);
 	printf("writer: owner ended -> layer took over and published its picture (correct)\n");
+
+	// --cost: 12 s at ~90 Hz with OBS watching -> the layer must log its cost on the game thread
+	if (g_costTest) {
+		wchar_t lp[MAX_PATH];
+		ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\ArchanVRCapture\\logs\\layer.log", lp, MAX_PATH);
+		char tag[64];
+		sprintf_s(tag, "[pid %lu ", GetCurrentProcessId());
+		auto costLines = [&](char *last, size_t lastSize) {
+			int count = 0;
+			FILE *lf = _wfopen(lp, L"r");
+			if (!lf)
+				return -1;
+			char line[2048];
+			while (fgets(line, sizeof(line), lf))
+				if (strstr(line, tag) && strstr(line, "cost on the game thread")) {
+					count++;
+					if (last)
+						strcpy_s(last, lastSize, line);
+				}
+			fclose(lf);
+			return count;
+		};
+		// game at ~90 Hz until two new cost lines are written (the second one = a full 10 s window)
+		// GPU-bound game: every frame queues more GPU work than the frame time (like DCS at 47 fps)
+		ID3D11Texture2D *load1 = nullptr, *load2 = nullptr;
+		{
+			D3D11_TEXTURE2D_DESC ld = {};
+			ld.Width = 4000;
+			ld.Height = 2250;
+			ld.MipLevels = 1;
+			ld.ArraySize = 1;
+			ld.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			ld.SampleDesc.Count = 1;
+			ld.Usage = D3D11_USAGE_DEFAULT;
+			CHECK(SUCCEEDED(g_dev->CreateTexture2D(&ld, nullptr, &load1)) &&
+				      SUCCEEDED(g_dev->CreateTexture2D(&ld, nullptr, &load2)),
+			      "load textures");
+		}
+		bool gpuBound = false, watching = true;
+		auto runCost = [&](const char *label) {
+			const int before = costLines(nullptr, 0);
+			CHECK(before >= 0, "open layer.log");
+			char found[2048] = "";
+			const uint64_t c0 = GetTickCount64();
+			int costFrames = 0;
+			while (GetTickCount64() - c0 < 30000 && costLines(found, sizeof(found)) < before + 2) {
+				view->readerTickMs = watching ? GetTickCount64() : 0;
+				if (gpuBound)
+					for (int i = 0; i < 120; i++)
+						g_ctx->CopyResource(load2, load1);
+				CHECK(submit() == XR_SUCCESS, "endframe");
+				submits++;
+				costFrames++;
+				if (!gpuBound)
+					Sleep(11); // ~90 Hz
+			}
+			CHECK(costLines(found, sizeof(found)) >= before + 2, "no full 'cost on the game thread' window in 30 s");
+			printf("writer %s: %d frames at ~90 Hz -> layer.log: %s", label, costFrames, strstr(found, "cost on"));
+			return 0;
+		};
+		if (runCost("(nobody reads the picture)"))
+			return 1;
+		// an OBS-like reader on its own device: every 33 ms take the picture, copy it, give it back, then
+		// keep the GPU busy (OBS renders the canvas and feeds the encoder)
+		std::atomic<bool> stopReader{false};
+		std::atomic<int> readerCopies{0}, readerError{0};
+		const uint32_t handle = view->sharedHandle;
+		std::thread reader([&]() {
+			ID3D11Device *d = nullptr;
+			ID3D11DeviceContext *x = nullptr;
+			ID3D11Texture2D *sh = nullptr, *own = nullptr, *b1 = nullptr, *b2 = nullptr;
+			IDXGIKeyedMutex *km = nullptr;
+			if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d,
+						     nullptr, &x))) {
+				readerError = 1;
+				return;
+			}
+			if (FAILED(d->OpenSharedResource((HANDLE)(uintptr_t)handle, __uuidof(ID3D11Texture2D), (void **)&sh)) ||
+			    FAILED(sh->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&km))) {
+				readerError = 2;
+			} else {
+				D3D11_TEXTURE2D_DESC td;
+				sh->GetDesc(&td);
+				td.MiscFlags = 0;
+				td.BindFlags = 0;
+				D3D11_TEXTURE2D_DESC bd = td;
+				bd.Width = 4000;
+				bd.Height = 2250;
+				if (FAILED(d->CreateTexture2D(&td, nullptr, &own)) || FAILED(d->CreateTexture2D(&bd, nullptr, &b1)) ||
+				    FAILED(d->CreateTexture2D(&bd, nullptr, &b2))) {
+					readerError = 3;
+				} else {
+					while (!stopReader) {
+						if (km->AcquireSync(0, 0) == S_OK) {
+							x->CopyResource(own, sh);
+							km->ReleaseSync(0);
+							readerCopies++;
+						}
+						for (int i = 0; i < 20; i++)
+							x->CopyResource(b2, b1);
+						x->Flush();
+						Sleep(33);
+					}
+				}
+			}
+			if (b2) b2->Release();
+			if (b1) b1->Release();
+			if (own) own->Release();
+			if (km) km->Release();
+			if (sh) sh->Release();
+			x->Release();
+			d->Release();
+		});
+		const int rc = runCost("(OBS-like reader every 33 ms)");
+		stopReader = true;
+		reader.join();
+		if (rc)
+			return 1;
+		CHECK(readerError == 0 && readerCopies > 0, "OBS-like reader: error %d, %d copies", readerError.load(),
+		      readerCopies.load());
+		printf("writer: OBS-like reader took the picture %d times\n", readerCopies.load());
+		// "moved or added": the same GPU-bound game with and without the capture copying
+		gpuBound = true;
+		watching = false;
+		if (runCost("(GPU-bound game, capture NOT copying)"))
+			return 1;
+		watching = true;
+		if (runCost("(GPU-bound game, capture copying)"))
+			return 1;
+		gpuBound = false;
+		load1->Release();
+		load2->Release();
+	}
 
 	// back to a clean state for the reader phase
 	view->readerTickMs = 0;
@@ -601,6 +778,7 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 	GET(xrDestroySwapchain, DestroySwapchain)
 	GET(xrDestroySession, DestroySession)
 	GET(xrDestroyInstance, DestroyInstance)
+	GET(xrCreateReferenceSpace, CreateReferenceSpace)
 #undef GET
 
 	XrGraphicsBindingD3D12KHR gb = {XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
@@ -609,6 +787,11 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO, &gb};
 	XrSession session;
 	CHECK(CreateSession(inst, &sci, &session) == XR_SUCCESS, "session");
+	XrReferenceSpaceCreateInfo rci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+	rci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	rci.poseInReferenceSpace = {SPACE_Q, {0, 0, 0}};
+	XrSpace space = XR_NULL_HANDLE;
+	CHECK(CreateReferenceSpace(session, &rci, &space) == XR_SUCCESS, "reference space");
 
 	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -646,12 +829,16 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 			views[v].subImage.swapchain = sc;
 			views[v].subImage.imageRect = {{RECT_X, RECT_Y}, {(int32_t)RECT_W, (int32_t)RECT_H}};
 			views[v].subImage.imageArrayIndex = v;
+			views[v].pose = {POSE_Q, {0, 0, 0}};
+			views[v].fov = POSE_FOV;
 		}
 		XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 		proj.viewCount = 2;
+		proj.space = space;
 		proj.views = views;
 		const XrCompositionLayerBaseHeader *layers[] = {(const XrCompositionLayerBaseHeader *)&proj};
 		XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
+		fei.displayTime = DISPLAY_TIME;
 		fei.layerCount = 1;
 		fei.layers = layers;
 		CHECK(EndFrame(session, &fei) == XR_SUCCESS, "endframe");
@@ -712,6 +899,8 @@ int main(int argc, char **argv)
 		printf("usage: layer_mock_test <layer.dll> [--d3d12] | --crop\n");
 		return 2;
 	}
+	if (argc >= 3 && strcmp(argv[2], "--cost") == 0)
+		g_costTest = true;
 	if (argc >= 3 && strcmp(argv[2], "--d3d12") == 0)
 		return RunWriterD3D12(argv[0], argv[1]);
 	return RunWriter(argv[0], argv[1]);

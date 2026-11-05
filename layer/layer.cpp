@@ -24,6 +24,8 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
@@ -100,6 +102,15 @@ PFN_xrEnumerateSwapchainImages next_EnumerateSwapchainImages = nullptr;
 PFN_xrAcquireSwapchainImage next_AcquireSwapchainImage = nullptr;
 PFN_xrReleaseSwapchainImage next_ReleaseSwapchainImage = nullptr;
 PFN_xrEndFrame next_EndFrame = nullptr;
+PFN_xrCreateReferenceSpace next_CreateReferenceSpace = nullptr;
+PFN_xrDestroySpace next_DestroySpace = nullptr;
+
+// Reference spaces the app created: type + pose, to know world "up" in the projection layer's space.
+struct SpaceInfo {
+	XrReferenceSpaceType type;
+	XrPosef pose;
+};
+std::unordered_map<XrSpace, SpaceInfo> g_spaces; // guarded by g_mutex
 
 // ---------------------------------------------------------------- state
 struct SwapchainInfo {
@@ -179,12 +190,33 @@ uint32_t g_sharedHandleVal = 0;
 uint32_t g_sharedFlags = 0;
 bool g_loggedNotOwner = false;
 bool g_loggedFirstCopy = false;
+bool g_loggedPose = false;
 bool g_loggedMsaa = false;
 bool g_loggedFormat = false;
 bool g_loggedNoProjection = false;
 bool g_readerWasActive = false;
 uint64_t g_readerActiveSinceMs = 0; // when this process last saw OBS start asking for the picture
 uint64_t g_copiedFrames = 0;
+
+// Cost measurement (2026-11-05, user: the capture must stay away from the game's render thread):
+// time this layer spends inside the game's xrEndFrame, on the game's thread, logged every 10 s.
+struct CostStats {
+	double freq = 0;           // QPC ticks per second
+	int64_t windowStart = 0;   // QPC
+	int64_t lastEndFrame = 0;  // QPC at the previous xrEndFrame (game frame interval)
+	std::vector<double> hookUs; // this layer's time per frame (copy frames only), microseconds
+	double flushUs = 0, copyUs = 0, intervalMs = 0, belowMs = 0;
+	double lockUs = 0, acquireUs = 0; // waiting for this layer's lock / for the shared picture (AcquireSync)
+	int64_t lockedAt = 0;             // QPC when the lock was taken this frame
+	uint32_t frames = 0, copies = 0;
+};
+CostStats g_cost;
+int64_t Qpc()
+{
+	LARGE_INTEGER v;
+	QueryPerformanceCounter(&v);
+	return v.QuadPart;
+}
 
 void ShmWriteBegin()
 {
@@ -401,6 +433,55 @@ bool EnsureSharedTexture(uint32_t w, uint32_t h, DXGI_FORMAT fmt, int64_t swapFm
 	return true;
 }
 
+// v = rotate vector by the inverse of unit quaternion q
+void RotateByInverse(const XrQuaternionf &q, const float in[3], float out[3])
+{
+	// conj(q) * v * q, expanded (t = 2 * cross(-q.xyz, v); v' = v + w*t + cross(-q.xyz, t))
+	const float qx = -q.x, qy = -q.y, qz = -q.z, qw = q.w;
+	const float tx = 2.0f * (qy * in[2] - qz * in[1]);
+	const float ty = 2.0f * (qz * in[0] - qx * in[2]);
+	const float tz = 2.0f * (qx * in[1] - qy * in[0]);
+	out[0] = in[0] + qw * tx + (qy * tz - qz * ty);
+	out[1] = in[1] + qw * ty + (qz * tx - qx * tz);
+	out[2] = in[2] + qw * tz + (qx * ty - qy * tx);
+}
+
+// Called while the shared texture's keyed mutex is held: the pose belongs to the copied picture.
+// fullRect: the whole imageRect was copied (the FOV describes exactly the copied picture).
+void WritePose(const XrFrameEndInfo *info, const XrCompositionLayerProjection *proj, bool fullRect)
+{
+	const XrCompositionLayerProjectionView &v = proj->views[0];
+	g_shm->displayTimeNs = info->displayTime;
+	g_shm->poseOrient[0] = v.pose.orientation.x;
+	g_shm->poseOrient[1] = v.pose.orientation.y;
+	g_shm->poseOrient[2] = v.pose.orientation.z;
+	g_shm->poseOrient[3] = v.pose.orientation.w;
+	g_shm->posePos[0] = v.pose.position.x;
+	g_shm->posePos[1] = v.pose.position.y;
+	g_shm->posePos[2] = v.pose.position.z;
+	g_shm->fovTan[0] = tanf(v.fov.angleLeft);
+	g_shm->fovTan[1] = tanf(v.fov.angleRight);
+	g_shm->fovTan[2] = tanf(v.fov.angleUp);
+	g_shm->fovTan[3] = tanf(v.fov.angleDown);
+	uint32_t flags = fullRect ? QVD_POSE_VALID : 0u;
+	auto it = g_spaces.find(proj->space);
+	if (it != g_spaces.end() &&
+	    (it->second.type == XR_REFERENCE_SPACE_TYPE_LOCAL || it->second.type == XR_REFERENCE_SPACE_TYPE_STAGE ||
+	     it->second.type == (XrReferenceSpaceType)1000426000 /* LOCAL_FLOOR */)) {
+		// these spaces have +Y against gravity; the app's space may be rotated by its pose
+		const float worldUp[3] = {0.0f, 1.0f, 0.0f};
+		RotateByInverse(it->second.pose.orientation, worldUp, g_shm->up);
+		flags |= QVD_POSE_UP;
+	}
+	g_shm->poseFlags = flags;
+	if (!g_loggedPose) {
+		Log("pose for stabilization: space type %d, %s, up %s (%.3f %.3f %.3f)",
+		    it != g_spaces.end() ? (int)it->second.type : -1, fullRect ? "full rect" : "CLAMPED rect - pose not used",
+		    (flags & QVD_POSE_UP) ? "known" : "unknown", g_shm->up[0], g_shm->up[1], g_shm->up[2]);
+		g_loggedPose = true;
+	}
+}
+
 void CaptureLeftEye(const XrFrameEndInfo *info)
 {
 	if (!g_device || !g_shm)
@@ -507,7 +588,11 @@ void CaptureLeftEye(const XrFrameEndInfo *info)
 		return;
 
 	// Never block the game: if OBS holds the texture right now, skip this frame.
-	if (g_sharedMutex->AcquireSync(0, 0) != S_OK)
+	const int64_t a0 = Qpc();
+	const HRESULT acq = g_sharedMutex->AcquireSync(0, 0);
+	const int64_t c0 = Qpc();
+	g_cost.acquireUs += (double)(c0 - a0) * 1e6 / g_cost.freq;
+	if (acq != S_OK)
 		return;
 	const UINT subres = D3D11CalcSubresource(0, sub.imageArrayIndex, sd.MipLevels);
 	D3D11_BOX box = {(UINT)x, (UINT)y, 0, (UINT)(x + w), (UINT)(y + h), 1};
@@ -517,8 +602,14 @@ void CaptureLeftEye(const XrFrameEndInfo *info)
 	g_context->CopySubresourceRegion(g_sharedTex, 0, 0, 0, 0, src, subres, &box);
 	if (g_on12)
 		g_on12->ReleaseWrappedResources(&wrapped, 1);
+	WritePose(info, proj, w == sub.imageRect.extent.width && h == sub.imageRect.extent.height);
 	g_sharedMutex->ReleaseSync(0);
+	const int64_t c1 = Qpc();
 	g_context->Flush();
+	const int64_t c2 = Qpc();
+	g_cost.copyUs += (double)(c1 - c0) * 1e6 / g_cost.freq;
+	g_cost.flushUs += (double)(c2 - c1) * 1e6 / g_cost.freq;
+	g_cost.copies++;
 
 	g_shm->writerTickMs = now;
 	g_shm->frameCount = g_shm->frameCount + 1;
@@ -600,7 +691,7 @@ XrResult XRAPI_CALL hook_xrCreateSession(XrInstance instance, const XrSessionCre
 		}
 	}
 	g_session = *session;
-	g_loggedFirstCopy = g_loggedMsaa = g_loggedFormat = g_loggedNoProjection = false;
+	g_loggedFirstCopy = g_loggedMsaa = g_loggedFormat = g_loggedNoProjection = g_loggedPose = false;
 	g_readerWasActive = false;
 	g_copiedFrames = 0;
 	OpenShm();
@@ -730,14 +821,101 @@ XrResult XRAPI_CALL hook_xrReleaseSwapchainImage(XrSwapchain swapchain, const Xr
 	return r;
 }
 
-XrResult XRAPI_CALL hook_xrEndFrame(XrSession session, const XrFrameEndInfo *info)
+XrResult XRAPI_CALL hook_xrCreateReferenceSpace(XrSession session, const XrReferenceSpaceCreateInfo *ci, XrSpace *space)
+{
+	XrResult r = next_CreateReferenceSpace(session, ci, space);
+	if (XR_SUCCEEDED(r) && ci && space) {
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_spaces[*space] = SpaceInfo{ci->referenceSpaceType, ci->poseInReferenceSpace};
+	}
+	return r;
+}
+
+XrResult XRAPI_CALL hook_xrDestroySpace(XrSpace space)
 {
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
+		g_spaces.erase(space);
+	}
+	return next_DestroySpace(space);
+}
+
+// Every 10 s while OBS is showing the picture: this layer's time on the game's thread.
+void CostLog(int64_t now)
+{
+	CostStats &c = g_cost;
+	if (!c.windowStart) { // OBS just started showing the picture: start a fresh window
+		const double freq = c.freq;
+		const int64_t last = c.lastEndFrame;
+		c = CostStats();
+		c.freq = freq;
+		c.lastEndFrame = last;
+		c.windowStart = now;
+		return;
+	}
+	if ((double)(now - c.windowStart) / c.freq < 10.0)
+		return;
+	if (c.copies == 0) {
+		Log("cost on the game thread (last %.0f s, %u game frames, 0 copied - OBS not showing the picture): game frame "
+		    "interval avg %.2f ms; runtime + layers below avg %.2f ms",
+		    (double)(now - c.windowStart) / c.freq, c.frames, c.frames ? c.intervalMs / c.frames : 0.0,
+		    c.frames ? c.belowMs / c.frames : 0.0);
+	} else if (!c.hookUs.empty()) {
+		std::vector<double> v = c.hookUs;
+		std::sort(v.begin(), v.end());
+		double sum = 0;
+		for (double x : v)
+			sum += x;
+		Log("cost on the game thread (last %.0f s, %u game frames, %u copied): this layer avg %.0f us, 99%% %.0f us, max "
+		    "%.0f us per copied frame (lock wait %.0f us, AcquireSync %.0f us, copy+pose %.0f us, flush %.0f us); game frame interval avg %.2f ms; runtime + layers "
+		    "below avg %.2f ms",
+		    (double)(now - c.windowStart) / c.freq, c.frames, c.copies, sum / v.size(), v[(size_t)(v.size() * 0.99)],
+		    v.back(), c.lockUs / c.copies, c.acquireUs / c.copies, c.copyUs / c.copies, c.flushUs / c.copies, c.frames ? c.intervalMs / c.frames : 0.0,
+		    c.frames ? c.belowMs / c.frames : 0.0);
+	}
+	const double freq = c.freq;
+	const int64_t last = c.lastEndFrame;
+	c = CostStats();
+	c.freq = freq;
+	c.windowStart = now;
+	c.lastEndFrame = last;
+}
+
+XrResult XRAPI_CALL hook_xrEndFrame(XrSession session, const XrFrameEndInfo *info)
+{
+	if (g_cost.freq == 0) {
+		LARGE_INTEGER f;
+		QueryPerformanceFrequency(&f);
+		g_cost.freq = (double)f.QuadPart;
+	}
+	const int64_t t0 = Qpc();
+	uint32_t copiesBefore;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_cost.lockedAt = Qpc();
+		copiesBefore = g_cost.copies;
 		if (session == g_session && info)
 			CaptureLeftEye(info);
 	}
-	return next_EndFrame(session, info);
+	const int64_t t1 = Qpc();
+	const XrResult r = next_EndFrame(session, info);
+	const int64_t t2 = Qpc();
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		CostStats &c = g_cost;
+		if (c.copies != copiesBefore) {
+			c.hookUs.push_back((double)(t1 - t0) * 1e6 / c.freq);
+			c.lockUs += (double)(c.lockedAt - t0) * 1e6 / c.freq;
+		}
+		if (c.lastEndFrame)
+			c.intervalMs += (double)(t0 - c.lastEndFrame) * 1e3 / c.freq;
+		c.lastEndFrame = t0;
+		c.belowMs += (double)(t2 - t1) * 1e3 / c.freq;
+		c.frames++;
+		if (session == g_session)
+			CostLog(t2); // also while nothing is copied: the game's own frame interval as the baseline
+	}
+	return r;
 }
 
 XrResult XRAPI_CALL hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_xrVoidFunction *function)
@@ -760,6 +938,8 @@ XrResult XRAPI_CALL hook_xrGetInstanceProcAddr(XrInstance instance, const char *
 	HOOK(xrAcquireSwapchainImage)
 	HOOK(xrReleaseSwapchainImage)
 	HOOK(xrEndFrame)
+	HOOK(xrCreateReferenceSpace)
+	HOOK(xrDestroySpace)
 #undef HOOK
 	return r;
 }
@@ -792,6 +972,8 @@ XrResult XRAPI_CALL layer_xrCreateApiLayerInstance(const XrInstanceCreateInfo *i
 	GET(AcquireSwapchainImage);
 	GET(ReleaseSwapchainImage);
 	GET(EndFrame);
+	GET(CreateReferenceSpace);
+	GET(DestroySpace);
 #undef GET
 
 	std::lock_guard<std::mutex> lock(g_mutex);

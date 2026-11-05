@@ -4,7 +4,7 @@
 #pragma once
 #include <stdint.h>
 
-#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v1"
+#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v2"
 
 /* Channel name. Tests set ARCHAN_VRCAPTURE_TEST_CHANNEL in their own processes so they never
  * touch the real channel of a running game or OBS. Requires <windows.h> before this header. */
@@ -19,7 +19,7 @@ static inline const wchar_t *qvd_channel_name(void)
 	return name;
 }
 #define QVD_MAGIC 0x31445651u /* "QVD1" */
-#define QVD_VERSION 1u
+#define QVD_VERSION 2u /* v2: per-frame pose for stabilization */
 
 /* Writer stops copying when OBS has not rendered the source for this long. */
 #define QVD_READER_TIMEOUT_MS 2000ull
@@ -47,8 +47,23 @@ struct QvdShared {
 	volatile uint64_t readerTickMs; /* GetTickCount64() at last OBS render */
 	char appName[128];
 	char runtimeName[128];
+
+	/* v2: pose of the copied left eye image, for stabilization. Written while the writer
+	 * holds the keyed mutex, so a reader holding the mutex gets the pose of the texture
+	 * content. OpenXR conventions: x right, y up, -z forward (the view looks along -z). */
+	int64_t displayTimeNs; /* predicted display time of the frame (XrTime, nanoseconds) */
+	float poseOrient[4];   /* x y z w: view 0 orientation in the projection layer's space */
+	float posePos[3];
+	float fovTan[4]; /* tan(angleLeft) tan(angleRight) tan(angleUp) tan(angleDown) of the image */
+	float up[3];     /* world up (against gravity) in that space; valid with QVD_POSE_UP */
+	uint32_t poseFlags;
 };
 #pragma pack(pop)
+
+enum QvdPoseFlags : uint32_t {
+	QVD_POSE_VALID = 1u, /* poseOrient/fovTan/displayTimeNs belong to the current texture */
+	QVD_POSE_UP = 2u,    /* up[] is known (LOCAL/STAGE/LOCAL_FLOOR reference space) */
+};
 
 /* Centre 16:9 rectangle inside a w x h image.
  * Exactly 16:9: width is a multiple of 32, height = width * 9 / 16 (a multiple of 18).
