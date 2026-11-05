@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "../common/qvd_shared.h"
+#include "../common/log_cleanup.h"
 
 // ---------------------------------------------------------------- test geometry
 static const uint32_t TEX_W = 2300, TEX_H = 2400; // swapchain texture
@@ -317,6 +318,20 @@ static int RunWriter(const char *exePath, const char *layerPath)
 	XrNegotiateApiLayerRequest rq = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST,
 					 XR_API_LAYER_INFO_STRUCT_VERSION, sizeof(rq)};
 	CHECK(negotiate(&li, "XR_APILAYER_ARCHAN_vr_capture", &rq) == XR_SUCCESS, "negotiate");
+	{ // game start: the layer cleans the log folder and says so in layer.log
+		wchar_t lp[MAX_PATH];
+		ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\ArchanVRCapture\\logs\\layer.log", lp, MAX_PATH);
+		FILE *lf = _wfopen(lp, L"r");
+		CHECK(lf, "open layer.log");
+		char tag[64], line[2048], found[2048] = "";
+		sprintf_s(tag, "[pid %lu ", GetCurrentProcessId());
+		while (fgets(line, sizeof(line), lf))
+			if (strstr(line, tag) && strstr(line, "log cleanup"))
+				strcpy_s(found, line);
+		fclose(lf);
+		CHECK(found[0], "layer load wrote no 'log cleanup' line");
+		printf("writer: layer load -> %s", strstr(found, "log cleanup"));
+	}
 
 	XrApiLayerNextInfo next = {XR_LOADER_INTERFACE_STRUCT_API_LAYER_NEXT_INFO, XR_API_LAYER_NEXT_INFO_STRUCT_VERSION,
 				   sizeof(next)};
@@ -860,6 +875,97 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 	return 0;
 }
 
+// ---------------------------------------------------------------- log cleanup (older than 48 h)
+static int RunCleanupTest()
+{
+	wchar_t tmp[MAX_PATH];
+	GetTempPathW(MAX_PATH, tmp);
+	wchar_t dirBuf[MAX_PATH];
+	swprintf_s(dirBuf, L"%sarchan_log_cleanup_test_%lu", tmp, GetCurrentProcessId());
+	const std::wstring dir = dirBuf;
+	CreateDirectoryW(dir.c_str(), nullptr);
+	FILETIME nowFt;
+	GetSystemTimeAsFileTime(&nowFt);
+	const unsigned long long now = qvd_ft64(nowFt), hour = 36000000000ull;
+	auto ago = [&](double hours) {
+		const unsigned long long v = now - (unsigned long long)(hours * hour);
+		FILETIME f;
+		f.dwLowDateTime = (DWORD)v;
+		f.dwHighDateTime = (DWORD)(v >> 32);
+		return f;
+	};
+	auto makeFile = [&](const wchar_t *name, double hoursAgo) {
+		const std::wstring path = dir + L"\\" + name;
+		HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		DWORD w;
+		WriteFile(h, "x", 1, &w, nullptr);
+		const FILETIME f = ago(hoursAgo);
+		SetFileTime(h, &f, &f, &f);
+		CloseHandle(h);
+		return true;
+	};
+	auto stamp = [&](double hoursAgo) {
+		FILETIME l;
+		SYSTEMTIME s;
+		const FILETIME u = ago(hoursAgo);
+		FileTimeToLocalFileTime(&u, &l);
+		FileTimeToSystemTime(&l, &s);
+		char b[64];
+		sprintf_s(b, "%04d-%02d-%02d %02d:%02d:%02d.%03d", s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond,
+			  s.wMilliseconds);
+		return std::string(b);
+	};
+	auto exists = [&](const wchar_t *name) { return GetFileAttributesW((dir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES; };
+	CHECK(makeFile(L"poses-3days.csv", 72) && makeFile(L"poses-49h.csv", 49) && makeFile(L"poses-47h.csv", 47) &&
+		      makeFile(L"poses-1h.csv", 1),
+	      "create test files");
+	const std::string log = stamp(72) + " [pid 1 DCS.exe] A 3 days old\n" + "continuation line of A (no time stamp)\n" +
+				stamp(49) + " [pid 1 DCS.exe] B 49 h old\n" + stamp(47) + " [pid 2 DCS.exe] C 47 h old\n" +
+				"continuation line of C (no time stamp)\n" + stamp(1) + " [pid 3 DCS.exe] D 1 h old\n";
+	{
+		FILE *f = _wfopen((dir + L"\\layer.log").c_str(), L"wb");
+		CHECK(f, "create layer.log");
+		fwrite(log.data(), 1, log.size(), f);
+		fclose(f);
+		HANDLE h = CreateFileW((dir + L"\\layer.log").c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+		const FILETIME old = ago(72); // the file itself is old too: it must be trimmed, never deleted
+		SetFileTime(h, &old, &old, &old);
+		CloseHandle(h);
+	}
+	const QvdLogCleanup c = qvd_cleanup_logs(dir, nowFt);
+	printf("cleanup: %d files deleted, %d failed, layer.log %d lines removed, %d kept\n", c.filesDeleted, c.filesFailed,
+	       c.linesRemoved, c.linesKept);
+	CHECK(c.filesDeleted == 2 && c.filesFailed == 0, "expected 2 files deleted");
+	CHECK(!exists(L"poses-3days.csv") && !exists(L"poses-49h.csv") && exists(L"poses-47h.csv") && exists(L"poses-1h.csv"),
+	      "wrong files deleted");
+	CHECK(exists(L"layer.log"), "layer.log was deleted (must only be trimmed)");
+	std::string after;
+	{
+		FILE *f = _wfopen((dir + L"\\layer.log").c_str(), L"rb");
+		CHECK(f, "open trimmed layer.log");
+		char b[4096];
+		size_t n;
+		while ((n = fread(b, 1, sizeof(b), f)) > 0)
+			after.append(b, n);
+		fclose(f);
+	}
+	const std::string expect = stamp(47) + " [pid 2 DCS.exe] C 47 h old\n" + "continuation line of C (no time stamp)\n" +
+				   stamp(1) + " [pid 3 DCS.exe] D 1 h old\n";
+	CHECK(c.linesRemoved == 3 && c.linesKept == 3 && after == expect, "layer.log trimmed wrong:\n%s", after.c_str());
+	const QvdLogCleanup c2 = qvd_cleanup_logs(dir, nowFt);
+	CHECK(c2.filesDeleted == 0 && c2.linesRemoved == 0, "second cleanup changed something");
+	printf("cleanup: 3-day and 49 h files deleted, 47 h and 1 h kept; layer.log lines A, B (+ A's continuation) "
+	       "removed, C, D (+ C's continuation) kept; second run changes nothing\n");
+	DeleteFileW((dir + L"\\poses-47h.csv").c_str());
+	DeleteFileW((dir + L"\\poses-1h.csv").c_str());
+	DeleteFileW((dir + L"\\layer.log").c_str());
+	RemoveDirectoryW(dir.c_str());
+	printf("cleanup PASS\n");
+	return 0;
+}
+
 static int RunCropTest()
 {
 	struct {
@@ -895,6 +1001,8 @@ int main(int argc, char **argv)
 	}
 	if (argc >= 2 && strcmp(argv[1], "--crop") == 0)
 		return RunCropTest();
+	if (argc >= 2 && strcmp(argv[1], "--cleanup") == 0)
+		return RunCleanupTest();
 	if (argc < 2) {
 		printf("usage: layer_mock_test <layer.dll> [--d3d12] | --crop\n");
 		return 2;

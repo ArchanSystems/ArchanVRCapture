@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "../common/qvd_shared.h"
+#include "../common/log_cleanup.h"
 
 #define LAYER_NAME "XR_APILAYER_ARCHAN_vr_capture"
 
@@ -80,6 +81,7 @@ void Log(const char *fmt, ...)
 	InitLogPath();
 	if (g_logPath.empty())
 		return;
+	QvdLogLock fileLock; // other games / the cleanup
 	FILE *f = _wfopen(g_logPath.c_str(), L"a");
 	if (!f)
 		return;
@@ -1010,5 +1012,12 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerIn
 	req->getInstanceProcAddr = hook_xrGetInstanceProcAddr;
 	req->createApiLayerInstance = layer_xrCreateApiLayerInstance;
 	Log("layer loaded");
+	static bool cleaned = false; // game start: delete logs older than 48 h (user decision 2026-11-05)
+	if (!cleaned) {
+		cleaned = true;
+		const QvdLogCleanup c = qvd_cleanup_logs_now();
+		Log("log cleanup (older than %.0f h): %d files deleted%s, %d old lines removed from layer.log", QVD_LOG_MAX_AGE_HOURS,
+		    c.filesDeleted, c.filesFailed ? " (some could not be deleted)" : "", c.linesRemoved);
+	}
 	return XR_SUCCESS;
 }

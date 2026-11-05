@@ -113,6 +113,10 @@ Install locations:
 
 ## Logs
 
+- Cleanup: on every OBS start and every game start, files in `%LOCALAPPDATA%\ArchanVRCapture\logs`
+  last written more than 48 h ago are deleted, and `layer.log` loses its lines older than 48 h
+  (`common/log_cleanup.h`; only this folder, OBS's own logs are left to OBS). Both write a
+  `log cleanup …` line.
 - Layer: `%LOCALAPPDATA%\ArchanVRCapture\logs\layer.log` (app, runtime, eye size, format, FOV).
   Every 10 s while OBS shows the picture: `cost on the game thread …` = the time this layer spends
   inside the game's xrEndFrame on the game's thread (avg / 99 % / max per copied frame, copy and
@@ -138,6 +142,7 @@ Install locations:
 
 ```powershell
 build\layer_mock_test.exe --crop
+build\layer_mock_test.exe --cleanup   # log cleanup on a temporary folder (48 h rule)
 build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll
 build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll --cost   # + the cost log line (~10 s at 90 Hz)
 build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll --d3d12

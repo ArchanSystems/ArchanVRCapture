@@ -39,6 +39,7 @@
 #include <thread>
 
 #include "../common/qvd_shared.h"
+#include "../common/log_cleanup.h"
 #include "stabilizer.h"
 
 OBS_DECLARE_MODULE()
@@ -1584,6 +1585,10 @@ bool obs_module_load(void)
 	LOG(LOG_INFO,
 	    "loaded (source 'archan_vr_capture', old ids 'quest_vd_vr_picture' 'vr_capture' kept; SteamVR mirror %s)",
 	    g_openvr ? "on" : "off");
+	// OBS start: delete logs older than 48 h (user decision 2026-11-05)
+	const QvdLogCleanup c = qvd_cleanup_logs_now();
+	LOG(LOG_INFO, "log cleanup (%%LOCALAPPDATA%%\\ArchanVRCapture\\logs, older than %.0f h): %d files deleted%s, %d old lines removed from layer.log",
+	    QVD_LOG_MAX_AGE_HOURS, c.filesDeleted, c.filesFailed ? " (some could not be deleted)" : "", c.linesRemoved);
 	return true;
 }
 
