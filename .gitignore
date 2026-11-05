@@ -1,0 +1,5 @@
+# build output (made by build.ps1)
+build/
+
+# third-party clones (each is its own git repository); exact versions are listed in README.md
+deps/

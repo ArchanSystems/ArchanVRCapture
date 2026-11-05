@@ -1,0 +1,64 @@
+# Installs VR Capture for the current user (no admin needed):
+#  - OpenXR layer  -> %LOCALAPPDATA%\VRCapture\layer, registered in HKCU as an implicit layer
+#  - OBS plugin    -> %ProgramData%\obs-studio\plugins\vr-capture
+# Every step is read back and compared. Close OBS before running.
+$ErrorActionPreference = "Stop"
+$root  = $PSScriptRoot
+$build = Join-Path $root "build"
+
+if (Get-Process obs64 -ErrorAction SilentlyContinue) { throw "OBS is running - close it first." }
+
+$layerSrcDll  = Join-Path $build "XR_APILAYER_VRCAPTURE_obs.dll"
+$layerSrcJson = Join-Path $root  "layer\XR_APILAYER_VRCAPTURE_obs.json"
+$pluginSrcDll = Join-Path $build "vr-capture.dll"
+$pluginSrcIni = Join-Path $root  "obs-plugin\data\locale\en-US.ini"
+$openvrSrc    = Join-Path $root  "deps\openvr\bin\win64\openvr_api.dll"
+foreach ($f in $layerSrcDll, $layerSrcJson, $pluginSrcDll, $pluginSrcIni, $openvrSrc) { if (-not (Test-Path $f)) { throw "missing $f - run build.ps1 first" } }
+
+# ---- remove the old "Quest VD to OBS" install (renamed to VR Capture); its logs are kept
+$key = "HKCU:\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
+$oldLayerDir  = Join-Path $env:LOCALAPPDATA "QuestVDtoOBS\layer"
+$oldPluginDir = Join-Path $env:ProgramData "obs-studio\plugins\quest-vd-obs"
+$oldJson = Join-Path $oldLayerDir "XR_APILAYER_QUESTVD_obs_capture.json"
+if (Get-ItemProperty -Path $key -Name $oldJson -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -Path $key -Name $oldJson
+}
+if (Get-ItemProperty -Path $key -Name $oldJson -ErrorAction SilentlyContinue) { throw "old registry value still present" }
+Write-Host "old layer registration absent: $oldJson"
+foreach ($d in $oldLayerDir, $oldPluginDir) {
+    if (Test-Path $d) { try { Remove-Item -Recurse -Force $d -ErrorAction Stop } catch {} }
+    if (Test-Path $d) {
+        # a running game still has the old (now unregistered) DLL loaded; run install again later
+        Write-Warning "old folder still present (file in use, run install.ps1 again later): $d"
+    } else {
+        Write-Host "old folder absent: $d"
+    }
+}
+
+$layerDir  = Join-Path $env:LOCALAPPDATA "VRCapture\layer"
+$pluginDir = Join-Path $env:ProgramData "obs-studio\plugins\vr-capture"
+New-Item -ItemType Directory -Force $layerDir | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $pluginDir "bin\64bit") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $pluginDir "data\locale") | Out-Null
+
+$copies = @(
+    @($layerSrcDll,  (Join-Path $layerDir "XR_APILAYER_VRCAPTURE_obs.dll")),
+    @($layerSrcJson, (Join-Path $layerDir "XR_APILAYER_VRCAPTURE_obs.json")),
+    @($pluginSrcDll, (Join-Path $pluginDir "bin\64bit\vr-capture.dll")),
+    @($openvrSrc,    (Join-Path $pluginDir "bin\64bit\openvr_api.dll")),
+    @($pluginSrcIni, (Join-Path $pluginDir "data\locale\en-US.ini"))
+)
+foreach ($c in $copies) {
+    Copy-Item -Force $c[0] $c[1]
+    $a = (Get-FileHash $c[0]).Hash; $b = (Get-FileHash $c[1]).Hash
+    if ($a -ne $b) { throw "copy verify failed: $($c[1])" }
+    Write-Host "copied + hash verified: $($c[1])  $b"
+}
+
+$json = Join-Path $layerDir "XR_APILAYER_VRCAPTURE_obs.json"
+if (-not (Test-Path $key)) { New-Item -Force $key | Out-Null }
+New-ItemProperty -Path $key -Name $json -Value 0 -PropertyType DWord -Force | Out-Null
+$back = (Get-ItemProperty -Path $key -Name $json).$json
+if ($back -ne 0) { throw "registry verify failed ($back)" }
+Write-Host "registered OpenXR layer (HKCU, enabled = 0): $json"
+Write-Host "INSTALL OK"
