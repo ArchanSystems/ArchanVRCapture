@@ -242,6 +242,32 @@ struct PoseSample {
 	Q q;
 };
 
+// Which buffered frames can still be shown (GPU memory, 2026-11-05). The frame shown at an output
+// time is the one nearest to it; the output times are T, T + P, T + 2P, ... (P = OBS frame period).
+// 'times' = the buffered frames' times, sorted. keep[i] = 0 for a frame that no future output time
+// can pick: none falls inside its nearest-frame interval, widened on both sides by 'margin' + 'grow'
+// x (how far ahead it is), because the output times drift a little with the game clock mapping
+// (more, the further ahead). The newest frame is always kept. Dropping frames only widens the
+// intervals of the others, so a frame that can be shown is never dropped.
+inline void FramesToKeep(const std::vector<double> &times, double T, double P, double margin, double grow,
+			 std::vector<char> &keep)
+{
+	const size_t n = times.size();
+	keep.assign(n, 1);
+	for (size_t i = 0; i + 1 < n; i++) {
+		const double m = margin + grow * std::max(0.0, times[i] - T);
+		const double lo = i ? 0.5 * (times[i - 1] + times[i]) - m : -1e300;
+		const double hi = 0.5 * (times[i] + times[i + 1]) + m;
+		if (hi < T) {
+			keep[i] = 0; // only output times that are already past would pick it
+			continue;
+		}
+		const double from = std::max(lo, T);
+		const double k = std::ceil((from - T) / P - 1e-9);
+		keep[i] = T + k * P <= hi ? 1 : 0;
+	}
+}
+
 // Look-ahead stabilizer.
 // The video is shown 'delay' seconds late, so at the output time T every head pose up to T + delay
 // is known. At each output the camera path on an even 30 Hz grid from T - 2h to T + delay is planned

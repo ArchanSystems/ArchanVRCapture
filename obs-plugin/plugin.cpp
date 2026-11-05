@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <iterator>
@@ -1078,21 +1079,39 @@ bool StabPick(QvdSource *s, gs_texture_t *latest, uint32_t latestFlags, DrawPick
 	const double now = (double)(frameNs ? frameNs : os_gettime_ns()) * 1e-9;
 	const double T = now + s->clockOffset - st.delay;
 	struct obs_video_info ovi;
-	if (obs_get_video_info(&ovi) && ovi.fps_den)
-		s->look.SetFrameRate((double)ovi.fps_num / ovi.fps_den);
+	double obsFps = 30.0;
+	if (obs_get_video_info(&ovi) && ovi.fps_den && ovi.fps_num)
+		obsFps = (double)ovi.fps_num / ovi.fps_den;
+	s->look.SetFrameRate(obsFps);
 
-	// free frames no longer needed (also stale frames from an earlier session)
+	// free frames no longer needed: stale frames from an earlier session, and every frame that no
+	// future output time can show (stab::FramesToKeep; replayed on all recorded sessions 2026-11-05
+	// at 30/60 fps and 0.2/1.0 s delay: the shown frame's time is the same in all 200686 OBS frames)
 	const double latestT = s->look.Latest();
-	size_t inUse = 0;
+	std::vector<QvdSource::BufFrame *> live;
 	for (QvdSource::BufFrame &b : s->buf) {
-		if (b.inUse && (b.t < T - 0.5 || b.t > latestT))
+		if (b.inUse && b.t > latestT)
 			b.inUse = false;
-		inUse += b.inUse;
+		if (b.inUse)
+			live.push_back(&b);
 	}
-	// drop unused textures beyond what the delay needs (+ a few spare)
+	std::sort(live.begin(), live.end(),
+		  [](const QvdSource::BufFrame *a, const QvdSource::BufFrame *b) { return a->t < b->t; });
+	std::vector<double> liveT(live.size());
+	for (size_t i = 0; i < live.size(); i++)
+		liveT[i] = live[i]->t;
+	std::vector<char> keep;
+	stab::FramesToKeep(liveT, T, 1.0 / obsFps, 0.003, 0.02, keep);
+	size_t inUse = 0;
+	for (size_t i = 0; i < live.size(); i++) {
+		if (!keep[i])
+			live[i]->inUse = false;
+		inUse += live[i]->inUse;
+	}
+	// drop unused textures beyond a few spare ones (reused for the next frames)
 	size_t spare = 0;
 	for (size_t i = 0; i < s->buf.size();) {
-		if (!s->buf[i].inUse && ++spare > 4) {
+		if (!s->buf[i].inUse && ++spare > 2) {
 			if (s->buf[i].tex)
 				gs_texture_destroy(s->buf[i].tex);
 			s->buf.erase(s->buf.begin() + (ptrdiff_t)i);
@@ -1296,12 +1315,19 @@ void CostAccount(QvdSource *s, double ms)
 	if (secs < 10.0)
 		return;
 	const uint32_t total = obs_get_total_frames(), lagged = obs_get_lagged_frames();
+	size_t bufUsed = 0;
+	double bufMb = 0;
+	for (const QvdSource::BufFrame &b : s->buf) {
+		bufUsed += b.inUse;
+		bufMb += (double)b.w * b.h * 4.0 / (1024.0 * 1024.0);
+	}
 	LOG(LOG_INFO,
 	    "cost (last %.0f s): this source on OBS's render thread avg %.2f ms, max %.2f ms per frame (%u renders); "
-	    "stabilization planner avg %.2f ms, max %.2f ms (%u plans); OBS frame render avg %.2f ms, lagged frames %u of %u",
+	    "stabilization planner avg %.2f ms, max %.2f ms (%u plans); delay buffer %zu frames in use + %zu spare = %.0f MB "
+	    "GPU memory; OBS frame render avg %.2f ms, lagged frames %u of %u",
 	    secs, c.renders ? c.sumMs / c.renders : 0.0, c.maxMs, c.renders, c.plans ? c.planSumMs / c.plans : 0.0,
-	    c.planMaxMs, c.plans, (double)obs_get_average_frame_time_ns() * 1e-6, lagged - c.laggedFrames,
-	    total - c.totalFrames);
+	    c.planMaxMs, c.plans, bufUsed, s->buf.size() - bufUsed, bufMb, (double)obs_get_average_frame_time_ns() * 1e-6,
+	    lagged - c.laggedFrames, total - c.totalFrames);
 	c = QvdSource::Cost();
 	c.windowNs = now;
 	c.totalFrames = total;

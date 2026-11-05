@@ -39,7 +39,7 @@ captured frames' own times jitter (17–52 ms apart in a real DCS recording).
 | Smoothness 0–100 | How freely the camera may leave your head's path: 0 follows the head, 100 = the smoothest path the crop allows. Default 50. |
 | Keep horizon level | The camera follows your view direction, not your head tilt (needs a gravity-aligned space: OpenXR LOCAL/STAGE/LOCAL_FLOOR, SteamVR). When the head tilts more than the crop allows, the camera has to tilt too: that tilt is planned like the rest of the path, so it eases in and out smoothly instead of jumping. |
 | Crop | Set by you (default 15 %). The room the camera may move in, see the table below. |
-| Video delay | Set by you (default 0.20 s, 0.1–2.0 s). GPU memory: about (delay + 0.5 s) × game frame rate × eye size × 4 bytes. |
+| Video delay | Set by you (default 0.20 s, 0.1–2.0 s). GPU memory: only frames a future OBS output frame can still show are kept, about (delay × OBS fps + 3) frames + 2 spare, × eye size × 4 bytes (Quest 3 / VD eye 26.8 MB: 0.20 s at 30 fps ≈ 0.3 GB). The OBS log line `cost (last 10 s)` shows the buffer's frames and MB. |
 
 Room per crop, from the plugin's own fit check (each direction alone, looking straight ahead):
 

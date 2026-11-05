@@ -79,6 +79,15 @@ int main(int argc, char **argv)
 	fprintf(o, "tick,T,frame_t,hqx,hqy,hqz,hqw,cqx,cqy,cqz,cqw,pqx,pqy,pqz,pqw,pulled,fits,guard_deg,level_fits\n");
 	size_t next = 0, frames = 0, edges = 0, pulledN = 0;
 	std::vector<size_t> buffered;
+	// STAB_KEEP_MS = margin (ms): also run the plugin's frame retention rule (FramesToKeep) and check
+	// that the frame picked from the kept frames is the same as from all frames, every OBS frame
+	const double keepMargin = getenv("STAB_KEEP_MS") ? atof(getenv("STAB_KEEP_MS")) * 1e-3 : -1.0;
+	const double keepGrow = getenv("STAB_KEEP_GROW") ? atof(getenv("STAB_KEEP_GROW")) : 0.0; // margin per s ahead
+	std::vector<size_t> kept;
+	std::vector<double> keptTimes;
+	std::vector<char> keepFlags;
+	size_t picksCompared = 0, picksDiffer = 0, keptMax = 0, oldMax = 0;
+	double keptSum = 0, oldSum = 0, prevT = 0;
 	bool haveOffset = false;
 	double offset = 0, worstMs = 0, sumMs = 0;
 	for (double tick = rows[0].obsT; tick <= rows.back().obsT; tick += 1.0 / fps) {
@@ -93,6 +102,7 @@ int main(int argc, char **argv)
 				offset += (off - offset) * 0.02;
 			}
 			buffered.push_back(next);
+			kept.push_back(next);
 			next++;
 		}
 		if (buffered.empty())
@@ -101,6 +111,19 @@ int main(int argc, char **argv)
 		if (skip > 0 && ((rng >> 8) & 0xFFFF) / 65536.0 < skip)
 			continue; // this OBS frame lagged: not rendered
 		const double T = tick + offset - st.delay;
+		const double lastT = prevT;
+		prevT = T;
+		if (keepMargin >= 0) {
+			keptTimes.clear();
+			for (size_t b : kept)
+				keptTimes.push_back(rows[b].t);
+			FramesToKeep(keptTimes, T, 1.0 / fps, keepMargin, keepGrow, keepFlags);
+			size_t w = 0;
+			for (size_t i = 0; i < kept.size(); i++)
+				if (keepFlags[i])
+					kept[w++] = kept[i];
+			kept.resize(w);
+		}
 		if (!la.Ready(T))
 			continue; // the plugin shows the plain picture until the delay buffer is filled
 		// frame nearest to T (stale frames far away are never nearest once real ones exist)
@@ -110,6 +133,27 @@ int main(int argc, char **argv)
 				pick = b;
 		if (std::fabs(rows[pick].t - T) > 0.5)
 			continue; // buffer not filled yet
+		if (keepMargin >= 0) {
+			size_t pk = kept[0];
+			for (size_t b : kept)
+				if (std::fabs(rows[b].t - T) < std::fabs(rows[pk].t - T))
+					pk = b;
+			picksCompared++;
+			const bool differ = rows[pk].t != rows[pick].t; // same time = same frame time (a tie)
+			picksDiffer += differ;
+			if (differ && picksDiffer <= 5)
+				printf("  differs at tick %.3f s: T %.4f, all frames -> %.4f (|d| %.1f ms), kept -> %.4f (|d| %.1f ms), %zu kept, "
+				       "previous T %.4f\n",
+				       tick - rows[0].obsT, T, rows[pick].t, std::fabs(rows[pick].t - T) * 1e3, rows[pk].t,
+				       std::fabs(rows[pk].t - T) * 1e3, kept.size(), lastT);
+			size_t old = 0; // what the plugin keeps today: from T - 0.5 s to the newest frame
+			for (size_t b : buffered)
+				old += rows[b].t >= T - 0.5;
+			keptSum += (double)kept.size();
+			oldSum += (double)old;
+			keptMax = std::max(keptMax, kept.size());
+			oldMax = std::max(oldMax, old);
+		}
 		const Row &r = rows[pick];
 		Image img;
 		const uint32_t cw = r.w & ~31u, ch = cw / 16u * 9u;
@@ -147,5 +191,10 @@ int main(int argc, char **argv)
 	       "camera time per frame avg %.2f ms max %.2f ms\n",
 	       st.crop, st.delay, st.smooth, st.horizon ? 1 : 0, frames, frames ? 100.0 * pulledN / frames : 0.0, edges,
 	       frames ? sumMs / frames : 0.0, worstMs);
-	return edges ? 1 : 0;
+	if (keepMargin >= 0)
+		printf("frame retention (margin %.1f ms): kept frames avg %.1f max %zu (today avg %.1f max %zu); picked frame "
+		       "differs in %zu of %zu OBS frames\n",
+		       keepMargin * 1e3, picksCompared ? keptSum / picksCompared : 0.0, keptMax,
+		       picksCompared ? oldSum / picksCompared : 0.0, oldMax, picksDiffer, picksCompared);
+	return edges || picksDiffer ? 1 : 0;
 }
