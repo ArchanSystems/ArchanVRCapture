@@ -263,12 +263,13 @@ int main(int argc, char **argv)
 
 	obs_properties_t *props = obs_source_properties(src);
 	obs_property_t *list = obs_properties_get(props, "resolution");
-	CHECK(list && obs_property_list_item_count(list) == 2, "picker must have exactly 2 choices");
+	CHECK(list && obs_property_list_item_count(list) == 3, "picker must have exactly 3 choices");
 	for (size_t i = 0; i < obs_property_list_item_count(list); i++)
 		printf("picker choice %zu: '%s' = '%s'\n", i, obs_property_list_item_name(list, i),
 		       obs_property_list_item_string(list, i));
 	CHECK(strcmp(obs_property_list_item_string(list, 0), "hmd") == 0 &&
-		      strcmp(obs_property_list_item_string(list, 1), "1920x1080") == 0,
+		      strcmp(obs_property_list_item_string(list, 1), "2560x1440") == 0 &&
+		      strcmp(obs_property_list_item_string(list, 2), "1920x1080") == 0,
 	      "picker values");
 	CHECK(!obs_properties_get(props, "apply"), "Apply button should be gone");
 	obs_properties_destroy(props);
@@ -302,6 +303,42 @@ int main(int argc, char **argv)
 	       (unsigned long long)bad, g_requests.size());
 	CHECK(bad == 0, "phase A picture");
 	CHECK(g_requests.empty(), "1920 mode at 1920x1080 must not ask for a change");
+
+	// ------------------------------------------------ phase A2: 1440p (user request 2026-11-06)
+	{
+		SetMode(src, "2560x1440");
+		CHECK(Render(src, 1920, 1080, out), "render A2a");
+		CHECK(g_requests.size() == 1 && g_requests[0].cx == 2560 && g_requests[0].cy == 1440,
+		      "1440p mode asked for %zu sizes (%ux%u)", g_requests.size(), g_requests.empty() ? 0 : g_requests[0].cx,
+		      g_requests.empty() ? 0 : g_requests[0].cy);
+		CHECK(ResetVideo(2560, 1440), "obs_reset_video 1440p");
+		g_requests.clear();
+		CHECK(Render(src, 2560, 1440, out), "render A2b");
+		int maxErr2 = 0;
+		uint64_t bad2 = 0;
+		for (uint32_t v = 0; v < 1440; v++)
+			for (uint32_t u = 0; u < 2560; u++) {
+				const double sx = c.x + (u + 0.5) * c.w / 2560.0 - 0.5;
+				const double sy = c.y + (v + 0.5) * c.h / 1440.0 - 0.5;
+				const double er = std::fmin(std::fmax(sx, 0.0), EYE_W - 1.0) * 255.0 / (EYE_W - 1);
+				const double eg = std::fmin(std::fmax(sy, 0.0), EYE_H - 1.0) * 255.0 / (EYE_H - 1);
+				const uint8_t *p = &out[((size_t)v * 2560 + u) * 4];
+				const int e = std::max(std::max((int)std::lround(std::fabs(p[0] - er)),
+								(int)std::lround(std::fabs(p[1] - eg))),
+						       std::max(std::abs((int)p[2] - 128), std::abs((int)p[3] - 255)));
+				maxErr2 = std::max(maxErr2, e);
+				bad2 += e > 2;
+			}
+		printf("phase A2 (1440p): asked OBS for 2560x1440; picture max error %d, %llu pixels off by more than 2, "
+		       "further requests %zu\n",
+		       maxErr2, (unsigned long long)bad2, g_requests.size());
+		CHECK(bad2 == 0, "phase A2 picture");
+		CHECK(g_requests.empty(), "1440p mode at 2560x1440 must not ask again");
+		SetMode(src, "1920x1080");
+		CHECK(ResetVideo(1920, 1080), "obs_reset_video back to 1080p");
+		CHECK(Render(src, 1920, 1080, out), "render A2c");
+		g_requests.clear();
+	}
 
 	// ------------------------------------------------ phase B: HMD res
 	SetMode(src, "hmd");
@@ -502,6 +539,170 @@ int main(int argc, char **argv)
 		tex2->Release();
 	}
 
+	// ------------------------------------------------ phase E: quad views, combined like the headset
+	// (user decision 2026-11-06). Wide view 200x216, blue channel 0 (a marker); the sharp inner view
+	// 440x400 over a narrower FOV, turned 2 deg, the full scene colour. The combined picture must be
+	// 1720x1534 (the inner sharpness over the whole wide FOV), HMD res must ask for its 16:9 crop
+	// 1696x954, and every output pixel must be the scene seen from the wide view's camera: blue from
+	// the inner view inside its area (by an independent CPU calculation of that area), 0 outside.
+	uint32_t canvasW = 512, canvasH = 288; // phase C's canvas
+	auto quadPhase = [&](const char *name, uint32_t WI, uint32_t HI, double ITL, double ITR, double ITU, double ITD,
+			     uint32_t reqW, uint32_t reqH, double CW, double CH, double cx0, double cy0) -> int {
+		const uint32_t WM = 200, HM = 216;
+		const double DEG = 3.14159265358979 / 180.0;
+		const double TL = std::tan(-49 * DEG), TR = std::tan(45 * DEG), TU = std::tan(48 * DEG), TD = std::tan(-50 * DEG);
+		const stab::Q qm = stab::Exp({0, 0.2, 0});
+		const stab::Q qi = stab::Mul(qm, stab::Exp({0, 2 * DEG, 0}));
+		auto makeTex = [&](uint32_t w, uint32_t h, ID3D11Texture2D **t, IDXGIKeyedMutex **k, uint32_t *handle) {
+			D3D11_TEXTURE2D_DESC d = td;
+			d.Width = w;
+			d.Height = h;
+			if (FAILED(dev->CreateTexture2D(&d, nullptr, t)))
+				return false;
+			IDXGIResource *r = nullptr;
+			HANDLE hh = nullptr;
+			(*t)->QueryInterface(__uuidof(IDXGIResource), (void **)&r);
+			const bool ok = r && SUCCEEDED(r->GetSharedHandle(&hh)) &&
+					SUCCEEDED((*t)->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)k));
+			if (r)
+				r->Release();
+			*handle = (uint32_t)(uintptr_t)hh;
+			return ok;
+		};
+		ID3D11Texture2D *texM = nullptr, *texI = nullptr;
+		IDXGIKeyedMutex *kmM = nullptr, *kmI = nullptr;
+		uint32_t hM = 0, hI = 0;
+		CHECK(makeTex(WM, HM, &texM, &kmM, &hM) && makeTex(WI, HI, &texI, &kmI, &hI), "phase E textures");
+		auto ray = [](double tl, double tr, double tu, double tdn, double u, double v) {
+			return stab::Normalize({tl + u * (tr - tl), tu - v * (tu - tdn), -1.0});
+		};
+		std::vector<uint32_t> pm((size_t)WM * HM), pi((size_t)WI * HI);
+		for (uint32_t y = 0; y < HM; y++)
+			for (uint32_t x = 0; x < WM; x++)
+				pm[(size_t)y * WM + x] =
+					Scene(stab::Rotate(qm, ray(TL, TR, TU, TD, (x + 0.5) / WM, (y + 0.5) / HM))) & 0xFF00FFFFu; // B = 0
+		for (uint32_t y = 0; y < HI; y++)
+			for (uint32_t x = 0; x < WI; x++)
+				pi[(size_t)y * WI + x] = Scene(stab::Rotate(qi, ray(ITL, ITR, ITU, ITD, (x + 0.5) / WI, (y + 0.5) / HI)));
+
+		obs_data_t *sd = obs_data_create();
+		obs_data_set_string(sd, "resolution", "hmd");
+		obs_data_set_bool(sd, "stab_enable", false);
+		obs_source_update(src, sd);
+		obs_data_release(sd);
+		Sleep(300);
+
+		shm->seq = shm->seq + 1;
+		shm->sharedHandle = hM;
+		shm->width = WM;
+		shm->height = HM;
+		shm->innerHandle = hI;
+		shm->innerWidth = WI;
+		shm->innerHeight = HI;
+		shm->innerDxgiFormat = shm->dxgiFormat;
+		shm->seq = shm->seq + 1;
+		auto sendFrame = [&]() {
+			if (kmM->AcquireSync(0, 1000) != S_OK)
+				return false;
+			ctx->UpdateSubresource(texM, 0, nullptr, pm.data(), WM * 4, 0);
+			shm->poseOrient[0] = (float)qm.x;
+			shm->poseOrient[1] = (float)qm.y;
+			shm->poseOrient[2] = (float)qm.z;
+			shm->poseOrient[3] = (float)qm.w;
+			shm->fovTan[0] = (float)TL;
+			shm->fovTan[1] = (float)TR;
+			shm->fovTan[2] = (float)TU;
+			shm->fovTan[3] = (float)TD;
+			shm->innerFovTan[0] = (float)ITL;
+			shm->innerFovTan[1] = (float)ITR;
+			shm->innerFovTan[2] = (float)ITU;
+			shm->innerFovTan[3] = (float)ITD;
+			shm->innerPoseOrient[0] = (float)qi.x;
+			shm->innerPoseOrient[1] = (float)qi.y;
+			shm->innerPoseOrient[2] = (float)qi.z;
+			shm->innerPoseOrient[3] = (float)qi.w;
+			shm->displayTimeNs = shm->displayTimeNs + 33333333;
+			shm->poseFlags = QVD_POSE_VALID | QVD_POSE_UP | QVD_POSE_INNER;
+			const bool ok = kmI->AcquireSync(0, 1000) == S_OK;
+			if (ok) {
+				ctx->UpdateSubresource(texI, 0, nullptr, pi.data(), WI * 4, 0);
+				kmI->ReleaseSync(0);
+			}
+			kmM->ReleaseSync(0);
+			ctx->Flush();
+			shm->frameCount = shm->frameCount + 1;
+			return ok;
+		};
+		g_requests.clear();
+		CHECK(sendFrame(), "phase %s frame 1", name);
+		CHECK(Render(src, canvasW, canvasH, out), "render %s1", name);
+		CHECK(!g_requests.empty(), "phase %s: HMD mode asked for no size", name);
+		printf("phase %s: quad views, HMD mode asked OBS for %ux%u (expected %ux%u)\n", name, g_requests.back().cx,
+		       g_requests.back().cy, reqW, reqH);
+		CHECK(g_requests.back().cx == reqW && g_requests.back().cy == reqH, "phase %s: wrong size", name);
+		CHECK(ResetVideo(reqW, reqH), "obs_reset_video phase %s", name);
+		canvasW = reqW;
+		canvasH = reqH;
+		CHECK(sendFrame(), "phase %s frame 2", name);
+		CHECK(Render(src, reqW, reqH, out), "render %s2", name);
+		framesC += 2; // the head motion recorder also writes these two frames' poses
+		lastQaC = qm;
+
+		// independent check of every output pixel (output = combined pixels cx0.., cy0.. of CW x CH)
+		const stab::Mat3 M = stab::MulM(stab::Transpose(stab::RotM(qi)), stab::RotM(qm));
+		uint64_t inside = 0, outside = 0, badIn = 0, badOut = 0;
+		int maxIn = 0, maxOutRG = 0, maxOutB = 0;
+		for (uint32_t v = 0; v < reqH; v++)
+			for (uint32_t u = 0; u < reqW; u++) {
+				const double cu = (cx0 + u + 0.5) / CW, cv = (cy0 + v + 0.5) / CH;
+				const stab::V3 d = {TL + cu * (TR - TL), TU - cv * (TU - TD), -1.0};
+				const stab::V3 di = {M.m[0][0] * d.x + M.m[0][1] * d.y + M.m[0][2] * d.z,
+						     M.m[1][0] * d.x + M.m[1][1] * d.y + M.m[1][2] * d.z,
+						     M.m[2][0] * d.x + M.m[2][1] * d.y + M.m[2][2] * d.z};
+				const double ux = (di.x / -di.z - ITL) / (ITR - ITL), uy = (ITU - di.y / -di.z) / (ITU - ITD);
+				const double edge = std::min(std::min(ux, 1.0 - ux), std::min(uy, 1.0 - uy));
+				const uint32_t e = Scene(stab::Rotate(qm, stab::Normalize(d)));
+				const uint8_t *p = &out[((size_t)v * reqW + u) * 4];
+				const int dr = std::abs((int)p[0] - (int)(e & 255u)), dg = std::abs((int)p[1] - (int)((e >> 8) & 255u));
+				const int db = std::abs((int)p[2] - (int)((e >> 16) & 255u));
+				if (edge > 0.03) { // the inner view, past its blend band
+					inside++;
+					const int m = std::max(dr, std::max(dg, db));
+					maxIn = std::max(maxIn, m);
+					badIn += m > 6;
+				} else if (edge < -0.01) { // the wide view
+					outside++;
+					maxOutRG = std::max(maxOutRG, std::max(dr, dg));
+					maxOutB = std::max(maxOutB, (int)p[2]);
+					badOut += std::max(dr, dg) > 12 || p[2] > 2;
+				}
+			}
+		printf("phase %s: %llu pixels inside the inner view: max error %d, %llu off by more than 6; %llu outside: max "
+		       "red/green error %d, max blue %d, %llu off\n",
+		       name, (unsigned long long)inside, maxIn, (unsigned long long)badIn, (unsigned long long)outside, maxOutRG,
+		       maxOutB, (unsigned long long)badOut);
+		CHECK(inside > 50000 && outside > 100000, "phase %s: area split looks wrong", name);
+		CHECK(badIn == 0, "phase %s: inner view area does not match the scene", name);
+		CHECK(badOut == 0, "phase %s: wide view area does not match the scene", name);
+		// back to one view for phase D
+		shm->seq = shm->seq + 1;
+		shm->innerHandle = 0;
+		shm->innerWidth = shm->innerHeight = 0;
+		shm->seq = shm->seq + 1;
+		kmM->Release();
+		kmI->Release();
+		texM->Release();
+		texI->Release();
+		return 0;
+	};
+	// E: combined 1720x1534 (440 px over 0.55 tan, carried over 2.15 tan), HMD asks for its crop 1696x954
+	if (quadPhase("E", 440, 400, -0.30, 0.25, 0.28, -0.32, 1696, 954, 1720, 1534, 12, 290))
+		return 1;
+	// F: the 4096 cap (user decision 2026-11-06). Full sharpness would be 9462x8373; the 8192 limit makes
+	// it 8192x7248 and the HMD cap 4096x3624, whose 16:9 crop is 4096x2304 at 0,660.
+	if (quadPhase("F", 880, 800, -0.10, 0.10, 0.10, -0.12, 4096, 2304, 4096, 3624, 0, 660))
+		return 1;
+
 	// ------------------------------------------------ phase D: audio Sync Offset follows the video delay
 	// (user decision 2026-11-05: all audio sources; own offset + delay; off / removed -> own offset back)
 	{
@@ -591,7 +792,7 @@ int main(int argc, char **argv)
 		double q[4] = {};
 		const int n = sscanf_s(last, "%llu,%lld,%15[^,],%lf,%lf,%lf,%lf", &obsT, &poseT, src, (unsigned)sizeof(src), &q[0],
 				       &q[1], &q[2], &q[3]);
-		printf("pose recorder: %s, %llu rows (plugin said %llu, phase C sent %d), last row %s q %.6f %.6f %.6f %.6f\n",
+		printf("pose recorder: %s, %llu rows (plugin said %llu, phases C + E sent %d), last row %s q %.6f %.6f %.6f %.6f\n",
 		       g_posePath.c_str(), rows, g_poseRows, framesC, src, q[0], q[1], q[2], q[3]);
 		CHECK(headerOk, "recorder header");
 		CHECK(rows == g_poseRows && rows == (unsigned long long)framesC, "row count");

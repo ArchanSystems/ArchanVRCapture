@@ -4,7 +4,7 @@
 #pragma once
 #include <stdint.h>
 
-#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v2"
+#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v3"
 
 /* Channel name. Tests set ARCHAN_VRCAPTURE_TEST_CHANNEL in their own processes so they never
  * touch the real channel of a running game or OBS. Requires <windows.h> before this header. */
@@ -19,7 +19,7 @@ static inline const wchar_t *qvd_channel_name(void)
 	return name;
 }
 #define QVD_MAGIC 0x31445651u /* "QVD1" */
-#define QVD_VERSION 2u /* v2: per-frame pose for stabilization */
+#define QVD_VERSION 3u /* v2: per-frame pose for stabilization; v3: quad views inner view */
 
 /* Writer stops copying when OBS has not rendered the source for this long. */
 #define QVD_READER_TIMEOUT_MS 2000ull
@@ -57,12 +57,24 @@ struct QvdShared {
 	float fovTan[4]; /* tan(angleLeft) tan(angleRight) tan(angleUp) tan(angleDown) of the image */
 	float up[3];     /* world up (against gravity) in that space; valid with QVD_POSE_UP */
 	uint32_t poseFlags;
+
+	/* v3: quad views (foveated rendering, 4 views): the sharp inner left view (view 2), copied into
+	 * its own shared texture. Handle/size/format are descriptor fields (seqlock, like the above); the
+	 * inner view's FOV and orientation are per frame, written while the writer holds BOTH keyed
+	 * mutexes (main first, then inner), valid with QVD_POSE_INNER. */
+	uint32_t innerHandle; /* legacy D3D11 shared handle, 0 = no inner view */
+	uint32_t innerWidth;
+	uint32_t innerHeight;
+	uint32_t innerDxgiFormat;
+	float innerFovTan[4];     /* tan(left) tan(right) tan(up) tan(down) of the inner image */
+	float innerPoseOrient[4]; /* x y z w, same space as poseOrient */
 };
 #pragma pack(pop)
 
 enum QvdPoseFlags : uint32_t {
 	QVD_POSE_VALID = 1u, /* poseOrient/fovTan/displayTimeNs belong to the current texture */
 	QVD_POSE_UP = 2u,    /* up[] is known (LOCAL/STAGE/LOCAL_FLOOR reference space) */
+	QVD_POSE_INNER = 4u, /* innerFovTan/innerPoseOrient belong to the current inner texture */
 };
 
 /* Centre 16:9 rectangle inside a w x h image.

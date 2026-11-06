@@ -190,6 +190,11 @@ IDXGIKeyedMutex *g_sharedMutex = nullptr;
 uint32_t g_sharedW = 0, g_sharedH = 0, g_sharedFmt = 0, g_sharedSwapFmt = 0;
 uint32_t g_sharedHandleVal = 0;
 uint32_t g_sharedFlags = 0;
+// quad views (4 views, foveated rendering): the sharp inner left view (view 2), second shared texture
+ID3D11Texture2D *g_innerTex = nullptr;
+IDXGIKeyedMutex *g_innerMutex = nullptr;
+uint32_t g_innerW = 0, g_innerH = 0, g_innerFmt = 0, g_innerHandleVal = 0;
+bool g_loggedInner = false;
 bool g_loggedNotOwner = false;
 bool g_loggedFirstCopy = false;
 bool g_loggedPose = false;
@@ -302,18 +307,40 @@ void Publish()
 	g_shm->dxgiFormat = g_sharedFmt;
 	g_shm->swapchainFormat = g_sharedSwapFmt;
 	g_shm->flags = g_sharedFlags;
+	g_shm->innerHandle = g_innerHandleVal;
+	g_shm->innerWidth = g_innerW;
+	g_shm->innerHeight = g_innerH;
+	g_shm->innerDxgiFormat = g_innerFmt;
 	g_shm->writerPid = GetCurrentProcessId();
 	strncpy_s(g_shm->appName, g_appName.c_str(), _TRUNCATE);
 	strncpy_s(g_shm->runtimeName, g_runtimeName.c_str(), _TRUNCATE);
 	ShmWriteEnd();
 }
 
+void ReleaseInnerTexture(bool publish)
+{
+	if (g_innerMutex) {
+		g_innerMutex->Release();
+		g_innerMutex = nullptr;
+	}
+	if (g_innerTex) {
+		g_innerTex->Release();
+		g_innerTex = nullptr;
+	}
+	g_innerW = g_innerH = g_innerFmt = g_innerHandleVal = 0;
+	if (publish && OwnsChannel() && g_sharedTex)
+		Publish();
+}
+
 void ReleaseSharedTexture()
 {
+	ReleaseInnerTexture(false);
 	if (OwnsChannel()) {
 		ShmWriteBegin();
 		g_shm->sharedHandle = 0;
 		g_shm->width = g_shm->height = 0;
+		g_shm->innerHandle = 0;
+		g_shm->innerWidth = g_shm->innerHeight = 0;
 		ShmWriteEnd();
 	}
 	if (g_sharedMutex) {
@@ -432,6 +459,50 @@ bool EnsureSharedTexture(uint32_t w, uint32_t h, DXGI_FORMAT fmt, int64_t swapFm
 	Publish();
 	Log("shared texture %ux%u shared-fmt %d swapchain-fmt %lld flags %u handle 0x%08X", w, h, (int)fmt,
 	    (long long)swapFmt, flags, (uint32_t)(uintptr_t)handle);
+	return true;
+}
+
+// The inner view's shared texture (quad views). Same kind as the main one; published with it.
+bool EnsureInnerTexture(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
+{
+	if (g_innerTex && g_innerW == w && g_innerH == h && g_innerFmt == (uint32_t)fmt)
+		return true;
+	ReleaseInnerTexture(false);
+	D3D11_TEXTURE2D_DESC d = {};
+	d.Width = w;
+	d.Height = h;
+	d.MipLevels = 1;
+	d.ArraySize = 1;
+	d.Format = fmt;
+	d.SampleDesc.Count = 1;
+	d.Usage = D3D11_USAGE_DEFAULT;
+	d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	d.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+	HRESULT hr = g_device->CreateTexture2D(&d, nullptr, &g_innerTex);
+	if (FAILED(hr)) {
+		Log("CreateTexture2D(inner %ux%u fmt %d) failed hr=0x%08lX", w, h, (int)fmt, hr);
+		return false;
+	}
+	hr = g_innerTex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&g_innerMutex);
+	IDXGIResource *res = nullptr;
+	HANDLE handle = nullptr;
+	if (SUCCEEDED(hr))
+		hr = g_innerTex->QueryInterface(__uuidof(IDXGIResource), (void **)&res);
+	if (SUCCEEDED(hr))
+		hr = res->GetSharedHandle(&handle);
+	if (res)
+		res->Release();
+	if (FAILED(hr) || !handle) {
+		Log("inner shared handle failed hr=0x%08lX", hr);
+		ReleaseInnerTexture(false);
+		return false;
+	}
+	g_innerW = w;
+	g_innerH = h;
+	g_innerFmt = (uint32_t)fmt;
+	g_innerHandleVal = (uint32_t)(uintptr_t)handle;
+	Publish();
+	Log("inner view shared texture %ux%u fmt %d handle 0x%08X (quad views)", w, h, (int)fmt, g_innerHandleVal);
 	return true;
 }
 
@@ -589,22 +660,95 @@ void CaptureLeftEye(const XrFrameEndInfo *info)
 	if (!EnsureSharedTexture((uint32_t)w, (uint32_t)h, sharedFmt, sc.format))
 		return;
 
-	// Never block the game: if OBS holds the texture right now, skip this frame.
+	// Quad views (4 views: 0/1 wide, 2/3 the sharp inner views of foveated rendering): the inner left
+	// view (2) is copied too, so OBS can put it into the wide view like the headset shows it.
+	ID3D11Texture2D *src2 = nullptr;
+	UINT subres2 = 0;
+	D3D11_BOX box2 = {};
+	bool inner = false;
+	if (proj->viewCount >= 4) {
+		const XrSwapchainSubImage &sub2 = proj->views[2].subImage;
+		auto it2 = g_swapchains.find(sub2.swapchain);
+		if (it2 != g_swapchains.end() && it2->second.lastReleased >= 0 &&
+		    (size_t)it2->second.lastReleased < it2->second.images.size()) {
+			src2 = it2->second.images[it2->second.lastReleased];
+			D3D11_TEXTURE2D_DESC sd2;
+			if (src2) {
+				src2->GetDesc(&sd2);
+				const DXGI_FORMAT fmt2 = SharedFormatFor(sd2.Format);
+				int32_t x2 = sub2.imageRect.offset.x, y2 = sub2.imageRect.offset.y;
+				int32_t w2 = sub2.imageRect.extent.width, h2 = sub2.imageRect.extent.height;
+				if (x2 < 0) x2 = 0;
+				if (y2 < 0) y2 = 0;
+				if (x2 + w2 > (int32_t)sd2.Width) w2 = (int32_t)sd2.Width - x2;
+				if (y2 + h2 > (int32_t)sd2.Height) h2 = (int32_t)sd2.Height - y2;
+				// same format family as the main view (one picture in OBS), whole rect, no MSAA
+				if (sd2.SampleDesc.Count == 1 && fmt2 == sharedFmt && w2 > 0 && h2 > 0 &&
+				    sub2.imageArrayIndex < sd2.ArraySize && w2 == sub2.imageRect.extent.width &&
+				    h2 == sub2.imageRect.extent.height && EnsureInnerTexture((uint32_t)w2, (uint32_t)h2, fmt2)) {
+					subres2 = D3D11CalcSubresource(0, sub2.imageArrayIndex, sd2.MipLevels);
+					box2 = {(UINT)x2, (UINT)y2, 0, (UINT)(x2 + w2), (UINT)(y2 + h2), 1};
+					inner = true;
+					if (!g_loggedInner) {
+						const XrFovf &f2 = proj->views[2].fov;
+						Log("quad views: inner left view rect %d,%d %dx%d array %u, tex %ux%u fmt %d, fov L %.2f R %.2f "
+						    "U %.2f D %.2f deg",
+						    x2, y2, w2, h2, sub2.imageArrayIndex, sd2.Width, sd2.Height, (int)sd2.Format,
+						    f2.angleLeft * 57.29578f, f2.angleRight * 57.29578f, f2.angleUp * 57.29578f,
+						    f2.angleDown * 57.29578f);
+						g_loggedInner = true;
+					}
+				} else if (!g_loggedInner) {
+					Log("quad views: inner left view not copied (format %d vs %d, rect %dx%d of %ux%u, samples %u)",
+					    (int)sd2.Format, (int)sd.Format, sub2.imageRect.extent.width, sub2.imageRect.extent.height,
+					    sd2.Width, sd2.Height, sd2.SampleDesc.Count);
+					g_loggedInner = true;
+				}
+			}
+		}
+	} else if (g_innerTex) {
+		ReleaseInnerTexture(true); // no longer quad views
+		Log("quad views ended - only the main view is copied");
+		g_loggedInner = false;
+	}
+
+	// Never block the game: if OBS holds a texture right now, skip this frame. Order: main, then inner
+	// (OBS takes them in the same order).
 	const int64_t a0 = Qpc();
-	const HRESULT acq = g_sharedMutex->AcquireSync(0, 0);
+	HRESULT acq = g_sharedMutex->AcquireSync(0, 0);
+	if (acq == S_OK && inner && g_innerMutex->AcquireSync(0, 0) != S_OK) {
+		g_sharedMutex->ReleaseSync(0);
+		acq = E_FAIL;
+	}
 	const int64_t c0 = Qpc();
 	g_cost.acquireUs += (double)(c0 - a0) * 1e6 / g_cost.freq;
 	if (acq != S_OK)
 		return;
 	const UINT subres = D3D11CalcSubresource(0, sub.imageArrayIndex, sd.MipLevels);
 	D3D11_BOX box = {(UINT)x, (UINT)y, 0, (UINT)(x + w), (UINT)(y + h), 1};
-	ID3D11Resource *wrapped = src;
+	ID3D11Resource *wrapped[2] = {src, src2};
+	const UINT nWrapped = (inner && src2 != src) ? 2u : 1u;
 	if (g_on12) // D3D12: the image is released in RENDER_TARGET on the game's queue (spec, khr_d3d12_enable)
-		g_on12->AcquireWrappedResources(&wrapped, 1);
+		g_on12->AcquireWrappedResources(wrapped, nWrapped);
 	g_context->CopySubresourceRegion(g_sharedTex, 0, 0, 0, 0, src, subres, &box);
+	if (inner)
+		g_context->CopySubresourceRegion(g_innerTex, 0, 0, 0, 0, src2, subres2, &box2);
 	if (g_on12)
-		g_on12->ReleaseWrappedResources(&wrapped, 1);
+		g_on12->ReleaseWrappedResources(wrapped, nWrapped);
 	WritePose(info, proj, w == sub.imageRect.extent.width && h == sub.imageRect.extent.height);
+	if (inner) {
+		const XrCompositionLayerProjectionView &v2 = proj->views[2];
+		g_shm->innerFovTan[0] = tanf(v2.fov.angleLeft);
+		g_shm->innerFovTan[1] = tanf(v2.fov.angleRight);
+		g_shm->innerFovTan[2] = tanf(v2.fov.angleUp);
+		g_shm->innerFovTan[3] = tanf(v2.fov.angleDown);
+		g_shm->innerPoseOrient[0] = v2.pose.orientation.x;
+		g_shm->innerPoseOrient[1] = v2.pose.orientation.y;
+		g_shm->innerPoseOrient[2] = v2.pose.orientation.z;
+		g_shm->innerPoseOrient[3] = v2.pose.orientation.w;
+		g_shm->poseFlags |= QVD_POSE_INNER;
+		g_innerMutex->ReleaseSync(0);
+	}
 	g_sharedMutex->ReleaseSync(0);
 	const int64_t c1 = Qpc();
 	g_context->Flush();

@@ -52,6 +52,11 @@ namespace {
 // Recording resolution modes (source setting "resolution")
 #define MODE_HMD "hmd"         // automatic: left eye native 16:9 crop size (1:1 pixels)
 #define MODE_1080 "1920x1080"  // fixed 1920x1080
+#define MODE_1440 "2560x1440"  // fixed 2560x1440 (user request 2026-11-06)
+// HMD res never asks for more than this width (16:9: 4096x2304). User decision 2026-11-06: NVENC H.264
+// encodes at most 4096 wide (obs-nvenc-test on an RTX 3090: h264 max_width 4096, hevc 8192); a quad
+// views picture of 5888x3312 failed to record ("Frame Dimension greater than the maximum").
+#define HMD_MAX_WIDTH 4096u
 
 // While OBS records, every new head pose of the shown picture is written to
 // %LOCALAPPDATA%\ArchanVRCapture\logs\poses-YYYYMMDD-HHMMSS.csv (to measure real head motion).
@@ -79,7 +84,22 @@ struct QvdSource {
 	uint64_t lastFrameCount = 0;
 	bool haveFrame = false;
 
+	// quad views (foveated rendering): the sharp inner left view, combined into the wide view
+	uint32_t innerHandle = 0, innerW = 0, innerH = 0, innerFmt = 0;
+	gs_texture_t *innerShared = nullptr;
+	gs_texture_t *innerCopy = nullptr;
+	bool innerFrame = false;      // the last copied frame came with its inner view
+	double innerTan[4] = {-1, 1, 1, -1};
+	stab::Q innerQ = {0, 0, 0, 1};
+	bool newLayerFrame = false;   // a new frame was copied this render
+	gs_texrender_t *composite = nullptr;
+	uint32_t compW = 0, compH = 0;
+	gs_effect_t *compEffect = nullptr;
+	bool compEffectFailed = false;
+	gs_texture_t *layerPic = nullptr; // the layer picture to show: the composite, or the copy
+
 	volatile bool modeHmd = true; // set from settings (UI thread), read by render thread
+	volatile uint32_t fixedW = 1920, fixedH = 1080; // the fixed size when not HMD res
 	uint64_t lastSizeRequest = 0;
 
 	// SteamVR mirror picture (used when no OpenXR layer picture is there)
@@ -496,8 +516,24 @@ void CloseTextures(QvdSource *s)
 		gs_texture_destroy(s->copy);
 		s->copy = nullptr;
 	}
+	if (s->innerShared) {
+		gs_texture_destroy(s->innerShared);
+		s->innerShared = nullptr;
+	}
+	if (s->innerCopy) {
+		gs_texture_destroy(s->innerCopy);
+		s->innerCopy = nullptr;
+	}
+	if (s->composite) {
+		gs_texrender_destroy(s->composite);
+		s->composite = nullptr;
+	}
+	s->compW = s->compH = 0;
+	s->innerFrame = false;
+	s->layerPic = nullptr;
 	s->haveFrame = false;
 	s->handle = 0;
+	s->innerHandle = 0;
 }
 
 void CloseShm(QvdSource *s)
@@ -566,6 +602,8 @@ bool ReadDescriptor(QvdSource *s)
 		const uint32_t handle = s->shm->sharedHandle;
 		const uint32_t w = s->shm->width, h = s->shm->height;
 		const uint32_t fmt = s->shm->dxgiFormat, flags = s->shm->flags, pid = s->shm->writerPid;
+		const uint32_t ih = s->shm->innerHandle, iw = s->shm->innerWidth, ihh = s->shm->innerHeight,
+			       ifmt = s->shm->innerDxgiFormat;
 		MemoryBarrier();
 		if (s->shm->seq != a)
 			continue;
@@ -579,6 +617,10 @@ bool ReadDescriptor(QvdSource *s)
 		s->dxgiFormat = fmt;
 		s->flags = flags;
 		s->writerPid = pid;
+		s->innerHandle = ih;
+		s->innerW = iw;
+		s->innerH = ihh;
+		s->innerFmt = ifmt;
 		return true;
 	}
 	return false;
@@ -599,6 +641,18 @@ void PollLayer(QvdSource *s)
 						    gs_texture_get_color_format(s->shared), 1, nullptr, 0);
 			LOG(LOG_INFO, "left eye picture %ux%u dxgi format %u flags %u", s->width, s->height,
 			    s->dxgiFormat, s->flags);
+			if (s->innerHandle) {
+				s->innerShared = gs_texture_open_shared(s->innerHandle);
+				if (s->innerShared) {
+					s->innerCopy = gs_texture_create(gs_texture_get_width(s->innerShared),
+									 gs_texture_get_height(s->innerShared),
+									 gs_texture_get_color_format(s->innerShared), 1, nullptr, 0);
+					LOG(LOG_INFO, "quad views: inner left view %ux%u dxgi format %u - combined into the wide view",
+					    s->innerW, s->innerH, s->innerFmt);
+				} else {
+					LOG(LOG_WARNING, "could not open the inner view's shared texture 0x%08X", s->innerHandle);
+				}
+			}
 		} else {
 			LOG(LOG_WARNING, "could not open shared texture 0x%08X", s->handle);
 		}
@@ -633,24 +687,192 @@ void PollLayer(QvdSource *s)
 					p.tNs = m->displayTimeNs;
 					p.seq++;
 				}
+				// the inner view (quad views): taken after the main one, as the layer does
+				s->innerFrame = false;
+				if (s->innerShared && s->innerCopy && (m->poseFlags & QVD_POSE_INNER) &&
+				    gs_texture_acquire_sync(s->innerShared, 0, 0) == 0) {
+					gs_copy_texture(s->innerCopy, s->innerShared);
+					for (int i = 0; i < 4; i++)
+						s->innerTan[i] = m->innerFovTan[i];
+					s->innerQ = {m->innerPoseOrient[0], m->innerPoseOrient[1], m->innerPoseOrient[2],
+						     m->innerPoseOrient[3]};
+					s->innerFrame = true;
+					gs_texture_release_sync(s->innerShared, 0);
+				}
 				gs_texture_release_sync(s->shared, 0);
 				s->lastFrameCount = fc;
 				s->haveFrame = true;
+				s->newLayerFrame = true;
 			}
 		}
 	}
 }
 
+// ---------------------------------------------------------------- quad views: combine like the headset
+// User decision 2026-11-06: with quad views (foveated rendering) the recording is the wide view scaled
+// up with the sharp inner view on top where it belongs, as the headset shows it (eye-tracked: the
+// sharp area moves with the eyes). For each output pixel: its ray in the wide view, turned into the
+// inner view's orientation; inside the inner view -> the inner picture (blended over a thin edge band),
+// else the wide picture. The result covers exactly the wide view's FOV, so everything after this
+// (16:9 crop, HMD res, stabilization) works on it unchanged.
+const char *kCompEffect = R"(
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d inner;
+uniform float4 mainTan;
+uniform float4 innerTan;
+uniform float4 r0;
+uniform float4 r1;
+uniform float4 r2;
+uniform float feather;
+
+sampler_state linearSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSCompose(VertData v_in) : TARGET
+{
+	float3 d = float3(mainTan.x + v_in.uv.x * (mainTan.y - mainTan.x),
+	                  mainTan.z - v_in.uv.y * (mainTan.z - mainTan.w), -1.0);
+	float3 di = float3(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d));
+	float2 ui = float2(0.0, 0.0);
+	float w = 0.0;
+	if (di.z < -0.000001) {
+		float xi = di.x / -di.z;
+		float yi = di.y / -di.z;
+		ui = float2((xi - innerTan.x) / (innerTan.y - innerTan.x), (innerTan.z - yi) / (innerTan.z - innerTan.w));
+		float edge = min(min(ui.x, 1.0 - ui.x), min(ui.y, 1.0 - ui.y));
+		w = saturate(edge / feather);
+	}
+	float4 c = image.Sample(linearSampler, v_in.uv);
+	float4 c2 = inner.Sample(linearSampler, saturate(ui));
+	return lerp(c, c2, w);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCompose(v_in);
+	}
+}
+)";
+
+// Draws the combined picture (graphics context). false = show the wide view alone.
+bool Compose(QvdSource *s)
+{
+	if (!s->compEffect && !s->compEffectFailed) {
+		char *err = nullptr;
+		s->compEffect = gs_effect_create(kCompEffect, "archan_vr_capture_compose.effect", &err);
+		if (!s->compEffect) {
+			LOG(LOG_WARNING, "quad views shader failed: %s - the wide view is shown alone", err ? err : "?");
+			s->compEffectFailed = true;
+		}
+		bfree(err);
+	}
+	if (!s->compEffect || !s->copy || !s->innerCopy)
+		return false;
+	const QvdSource::Pose &mp = s->layerPose;
+	const double *mt = mp.tan, *it = s->innerTan;
+	if (!(mt[1] > mt[0] && mt[2] > mt[3] && it[1] > it[0] && it[2] > it[3]))
+		return false;
+	// size: the inner view's sharpness over the whole wide FOV (fixed while the image sizes stay)
+	if (s->compW == 0) {
+		double cw = (double)s->innerW * (mt[1] - mt[0]) / (it[1] - it[0]);
+		double ch = (double)s->innerH * (mt[2] - mt[3]) / (it[2] - it[3]);
+		const double sc = std::min(1.0, 8192.0 / std::max(cw, ch));
+		cw *= sc;
+		ch *= sc;
+		s->compW = std::max(s->width, (uint32_t)std::lround(cw) & ~1u);
+		s->compH = std::max(s->height, (uint32_t)std::lround(ch) & ~1u);
+		// no larger than HMD res can use: its 16:9 crop at most HMD_MAX_WIDTH wide (less GPU memory)
+		for (int i = 0; i < 4; i++) {
+			const QvdRect c = qvd_center_crop_16x9(s->compW, s->compH);
+			if (c.w <= HMD_MAX_WIDTH)
+				break;
+			const double k = (double)HMD_MAX_WIDTH / c.w;
+			s->compW = (uint32_t)std::lround(s->compW * k) & ~1u;
+			s->compH = (uint32_t)std::lround(s->compH * k) & ~1u;
+		}
+		LOG(LOG_INFO,
+		    "quad views: combined picture %ux%u (wide view %ux%u, inner view %ux%u over FOV tan L %.3f R %.3f U %.3f "
+		    "D %.3f of L %.3f R %.3f U %.3f D %.3f)",
+		    s->compW, s->compH, s->width, s->height, s->innerW, s->innerH, it[0], it[1], it[2], it[3], mt[0], mt[1],
+		    mt[2], mt[3]);
+	}
+	if (!s->composite)
+		s->composite = gs_texrender_create(gs_texture_get_color_format(s->copy), GS_ZS_NONE);
+	if (!s->composite)
+		return false;
+	// wide view -> inner view directions: R_inner^-1 * R_main
+	const stab::Mat3 M = stab::MulM(stab::Transpose(stab::RotM(stab::NormalizeQ(s->innerQ))),
+					stab::RotM(stab::NormalizeQ(mp.q)));
+	gs_texrender_reset(s->composite);
+	if (!gs_texrender_begin(s->composite, s->compW, s->compH))
+		return false;
+	gs_ortho(0.0f, (float)s->compW, 0.0f, (float)s->compH, -100.0f, 100.0f);
+	gs_blend_state_push();
+	gs_enable_blending(false);
+	const bool prevSrgb = gs_framebuffer_srgb_enabled();
+	gs_enable_framebuffer_srgb(false); // bytes as they are (the picture is shown later as before)
+	gs_effect_t *e = s->compEffect;
+	gs_effect_set_texture(gs_effect_get_param_by_name(e, "image"), s->copy);
+	gs_effect_set_texture(gs_effect_get_param_by_name(e, "inner"), s->innerCopy);
+	struct vec4 v;
+	vec4_set(&v, (float)mt[0], (float)mt[1], (float)mt[2], (float)mt[3]);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(e, "mainTan"), &v);
+	vec4_set(&v, (float)it[0], (float)it[1], (float)it[2], (float)it[3]);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(e, "innerTan"), &v);
+	const char *rows[3] = {"r0", "r1", "r2"};
+	for (int i = 0; i < 3; i++) {
+		vec4_set(&v, (float)M.m[i][0], (float)M.m[i][1], (float)M.m[i][2], 0.0f);
+		gs_effect_set_vec4(gs_effect_get_param_by_name(e, rows[i]), &v);
+	}
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "feather"), 0.02f);
+	while (gs_effect_loop(e, "Draw"))
+		gs_draw_sprite(s->copy, 0, s->compW, s->compH);
+	gs_enable_framebuffer_srgb(prevSrgb);
+	gs_blend_state_pop();
+	gs_texrender_end(s->composite);
+	return true;
+}
+
 // Picks the picture: the OpenXR layer (game frames) first, else SteamVR's mirror.
 void Poll(QvdSource *s)
 {
+	s->newLayerFrame = false;
 	PollLayer(s);
 	int kind = 0;
 	uint32_t w = 0, h = 0;
 	if (s->shared && s->copy && s->haveFrame) {
 		kind = 1;
-		w = s->width;
-		h = s->height;
+		if (s->newLayerFrame || !s->layerPic) {
+			const bool composed = s->innerFrame && Compose(s);
+			s->layerPic = composed ? gs_texrender_get_texture(s->composite) : s->copy;
+		}
+		if (s->layerPic != s->copy && s->layerPic) {
+			w = s->compW;
+			h = s->compH;
+		} else {
+			w = s->width;
+			h = s->height;
+		}
 	} else if (CopyMirror(s)) {
 		kind = 2;
 		w = gs_texture_get_width(s->mirrorCopy);
@@ -1204,11 +1426,15 @@ void qvd_update(void *data, obs_data_t *settings)
 	QvdSource *s = static_cast<QvdSource *>(data);
 	const char *mode = obs_data_get_string(settings, "resolution");
 	const bool is1080 = mode && strcmp(mode, MODE_1080) == 0;
-	if (!is1080 && !(mode && strcmp(mode, MODE_HMD) == 0))
+	const bool is1440 = mode && strcmp(mode, MODE_1440) == 0;
+	s->fixedW = is1440 ? 2560 : 1920;
+	s->fixedH = is1440 ? 1440 : 1080;
+	if (!is1080 && !is1440 && !(mode && strcmp(mode, MODE_HMD) == 0))
 		LOG(LOG_INFO, "resolution setting '%s' is not a current choice -> HMD res", mode ? mode : "");
-	s->modeHmd = !is1080;
+	s->modeHmd = !is1080 && !is1440;
 	s->lastSizeRequest = 0; // act on the new choice right away
-	LOG(LOG_INFO, "recording resolution mode: %s", s->modeHmd ? "HMD res (automatic)" : "1920x1080");
+	LOG(LOG_INFO, "recording resolution mode: %s",
+	    s->modeHmd ? "HMD res (automatic)" : (is1440 ? "2560x1440" : "1920x1080"));
 
 	stab::Settings st;
 	st.enable = obs_data_get_bool(settings, "stab_enable");
@@ -1271,6 +1497,9 @@ void qvd_destroy(void *data)
 	if (s->stabEffect)
 		gs_effect_destroy(s->stabEffect);
 	s->stabEffect = nullptr;
+	if (s->compEffect)
+		gs_effect_destroy(s->compEffect);
+	s->compEffect = nullptr;
 	FreeBuffer(s);
 	obs_leave_graphics();
 	if (s->recorder.f) {
@@ -1349,7 +1578,7 @@ void qvd_video_render_inner(QvdSource *s)
 	PoseRecord(s, s->recorder);
 	if (s->picKind == 0)
 		return;
-	gs_texture_t *pic = s->picKind == 1 ? s->copy : s->mirrorCopy;
+	gs_texture_t *pic = s->picKind == 1 ? (s->layerPic ? s->layerPic : s->copy) : s->mirrorCopy;
 	uint32_t picFlags = s->picKind == 1 ? s->flags : s->mirrorFlags;
 	KeepVideoSize(s);
 
@@ -1456,11 +1685,15 @@ void SetVideoSizeTask(void *param)
 // Render thread: while the game picture is shown, keep OBS at the chosen size.
 void KeepVideoSize(QvdSource *s)
 {
-	uint32_t cx = 1920, cy = 1080;
+	uint32_t cx = s->fixedW, cy = s->fixedH;
 	if (s->modeHmd) {
 		const QvdRect c = qvd_center_crop_16x9(s->picW, s->picH);
 		cx = c.w;
 		cy = c.h;
+		if (cx > HMD_MAX_WIDTH) { // keep 16:9 (the crop is exactly 16:9)
+			cx = HMD_MAX_WIDTH;
+			cy = HMD_MAX_WIDTH / 16u * 9u;
+		}
 	}
 	struct obs_video_info ovi = {};
 	if (!obs_get_video_info(&ovi) || cx < 32 || cy < 18)
@@ -1505,6 +1738,7 @@ obs_properties_t *qvd_get_properties(void *data)
 	obs_property_t *list = obs_properties_add_list(props, "resolution", obs_module_text("RecordResolution"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(list, obs_module_text("Mode.Hmd"), MODE_HMD);
+	obs_property_list_add_string(list, obs_module_text("Mode.1440"), MODE_1440);
 	obs_property_list_add_string(list, obs_module_text("Mode.1080"), MODE_1080);
 
 	// stabilization: the group's checkbox is On / Off

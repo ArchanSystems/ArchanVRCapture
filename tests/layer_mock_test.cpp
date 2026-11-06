@@ -46,6 +46,14 @@ static const XrTime DISPLAY_TIME = 7000000000ll;
 // world up in that space = rotate (0,1,0) by -30 deg about x = (0, cos 30, -sin 30)
 static const float UP_EXPECTED[3] = {0.0f, 0.86602540f, -0.5f};
 
+// --quad: quad views (foveated rendering). Views 2/3 = the sharp inner views; the inner left view is
+// slice 1 of the swapchain at its own rect, with its own FOV and pose (checked by the reader).
+static bool g_quad = false;
+static const int32_t INNER_X = 600, INNER_Y = 700;
+static const uint32_t INNER_W = 900, INNER_H = 800;
+static const XrFovf INNER_FOV = {-0.30f, 0.25f, 0.28f, -0.32f};
+static const XrQuaternionf INNER_Q = {0.0f, 0.39874907f, 0.0f, 0.91706007f}; // 47 deg yaw
+
 static uint32_t Expected(uint32_t imageIndex, uint32_t slice, uint32_t x, uint32_t y)
 {
 	// RGBA8 bytes: R = x, G = y, B = image/slice marker, A = 255
@@ -196,7 +204,10 @@ static int RunReader()
 	       shm->poseFlags, shm->poseOrient[0], shm->poseOrient[1], shm->poseOrient[2], shm->poseOrient[3],
 	       shm->fovTan[0], shm->fovTan[1], shm->fovTan[2], shm->fovTan[3], shm->up[0], shm->up[1], shm->up[2],
 	       (long long)shm->displayTimeNs);
-	CHECK(shm->poseFlags == (QVD_POSE_VALID | QVD_POSE_UP), "pose flags %u", shm->poseFlags);
+	CHECK(shm->poseFlags == (QVD_POSE_VALID | QVD_POSE_UP | (g_quad ? QVD_POSE_INNER : 0u)), "pose flags %u",
+	      shm->poseFlags);
+	if (!g_quad)
+		CHECK(shm->innerHandle == 0 && shm->innerWidth == 0, "inner view published without quad views");
 	const float eq[4] = {POSE_Q.x, POSE_Q.y, POSE_Q.z, POSE_Q.w};
 	const float ef[4] = {tanf(POSE_FOV.angleLeft), tanf(POSE_FOV.angleRight), tanf(POSE_FOV.angleUp), tanf(POSE_FOV.angleDown)};
 	for (int i = 0; i < 4; i++) {
@@ -251,6 +262,61 @@ static int RunReader()
 	printf("reader: checked %u x %u pixels against left eye (slice 0), image %u, rect offset %d,%d: %llu mismatches\n",
 	       RECT_W, RECT_H, lastImage, RECT_X, RECT_Y, (unsigned long long)bad);
 	CHECK(bad == 0, "pixel mismatches");
+
+	if (g_quad) { // the inner left view: its own texture, FOV and pose
+		printf("reader: inner view handle 0x%08X %ux%u fmt %u, fov tan %.6f %.6f %.6f %.6f, q %.6f %.6f %.6f %.6f\n",
+		       shm->innerHandle, shm->innerWidth, shm->innerHeight, shm->innerDxgiFormat, shm->innerFovTan[0],
+		       shm->innerFovTan[1], shm->innerFovTan[2], shm->innerFovTan[3], shm->innerPoseOrient[0],
+		       shm->innerPoseOrient[1], shm->innerPoseOrient[2], shm->innerPoseOrient[3]);
+		CHECK(shm->innerHandle != 0 && shm->innerWidth == INNER_W && shm->innerHeight == INNER_H &&
+			      shm->innerDxgiFormat == DXGI_FORMAT_R8G8B8A8_TYPELESS,
+		      "inner descriptor");
+		const float iq[4] = {INNER_Q.x, INNER_Q.y, INNER_Q.z, INNER_Q.w};
+		const float itn[4] = {tanf(INNER_FOV.angleLeft), tanf(INNER_FOV.angleRight), tanf(INNER_FOV.angleUp),
+				      tanf(INNER_FOV.angleDown)};
+		for (int i = 0; i < 4; i++) {
+			CHECK(fabsf(shm->innerPoseOrient[i] - iq[i]) < 1e-6f, "inner orientation [%d]", i);
+			CHECK(fabsf(shm->innerFovTan[i] - itn[i]) < 1e-6f, "inner fov tangent [%d]", i);
+		}
+		ID3D11Texture2D *inner = nullptr;
+		CHECK(SUCCEEDED(dev->OpenSharedResource((HANDLE)(uintptr_t)shm->innerHandle, __uuidof(ID3D11Texture2D),
+							(void **)&inner)),
+		      "OpenSharedResource inner");
+		IDXGIKeyedMutex *ikm = nullptr;
+		CHECK(SUCCEEDED(inner->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&ikm)), "inner keyed mutex");
+		D3D11_TEXTURE2D_DESC d2;
+		inner->GetDesc(&d2);
+		d2.Usage = D3D11_USAGE_STAGING;
+		d2.BindFlags = 0;
+		d2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		d2.MiscFlags = 0;
+		d2.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		ID3D11Texture2D *staging2 = nullptr;
+		CHECK(SUCCEEDED(dev->CreateTexture2D(&d2, nullptr, &staging2)), "inner staging");
+		CHECK(km->AcquireSync(0, 1000) == S_OK && ikm->AcquireSync(0, 1000) == S_OK, "AcquireSync main + inner");
+		ctx->CopyResource(staging2, inner);
+		ikm->ReleaseSync(0);
+		km->ReleaseSync(0);
+		D3D11_MAPPED_SUBRESOURCE m2;
+		CHECK(SUCCEEDED(ctx->Map(staging2, 0, D3D11_MAP_READ, 0, &m2)), "map inner");
+		uint64_t bad2 = 0;
+		for (uint32_t y = 0; y < INNER_H; y++) {
+			const uint32_t *row = (const uint32_t *)((const uint8_t *)m2.pData + (size_t)y * m2.RowPitch);
+			for (uint32_t x = 0; x < INNER_W; x++) {
+				const uint32_t e = Expected(lastImage, 1, INNER_X + x, INNER_Y + y);
+				if (row[x] != e) {
+					if (bad2 < 5)
+						printf("  inner mismatch at %u,%u got %08X expected %08X\n", x, y, row[x], e);
+					bad2++;
+				}
+			}
+		}
+		ctx->Unmap(staging2, 0);
+		printf("reader: checked %u x %u pixels against the inner left view (slice 1), rect offset %d,%d: %llu "
+		       "mismatches\n",
+		       INNER_W, INNER_H, INNER_X, INNER_Y, (unsigned long long)bad2);
+		CHECK(bad2 == 0, "inner pixel mismatches");
+	}
 	return 0;
 }
 
@@ -394,8 +460,9 @@ static int RunWriter(const char *exePath, const char *layerPath)
 		uint32_t idx;
 		AcquireSwapchainImage(sc, nullptr, &idx);
 		ReleaseSwapchainImage(sc, nullptr);
-		XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
-							      {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+		XrCompositionLayerProjectionView views[4] = {
+			{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+			{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
 		for (uint32_t v = 0; v < 2; v++) {
 			views[v].subImage.swapchain = sc;
 			views[v].subImage.imageRect = {{RECT_X, RECT_Y}, {(int32_t)RECT_W, (int32_t)RECT_H}};
@@ -403,8 +470,15 @@ static int RunWriter(const char *exePath, const char *layerPath)
 			views[v].pose = {POSE_Q, {0, 0, 0}};
 			views[v].fov = POSE_FOV;
 		}
+		for (uint32_t v = 2; v < 4; v++) { // the inner views (quad views)
+			views[v].subImage.swapchain = sc;
+			views[v].subImage.imageRect = {{INNER_X, INNER_Y}, {(int32_t)INNER_W, (int32_t)INNER_H}};
+			views[v].subImage.imageArrayIndex = v == 2 ? 1u : 0u;
+			views[v].pose = {INNER_Q, {0, 0, 0}};
+			views[v].fov = INNER_FOV;
+		}
 		XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-		proj.viewCount = 2;
+		proj.viewCount = g_quad ? 4 : 2;
 		proj.space = space;
 		proj.views = views;
 		const XrCompositionLayerBaseHeader *layers[] = {(const XrCompositionLayerBaseHeader *)&proj};
@@ -622,7 +696,7 @@ static int RunWriter(const char *exePath, const char *layerPath)
 	// 2) start the reader process
 	HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, L"Local\\QVDTest_ReaderReady");
 	HANDLE done = CreateEventW(nullptr, TRUE, FALSE, L"Local\\QVDTest_FramesDone");
-	std::string cmd = std::string("\"") + exePath + "\" --reader";
+	std::string cmd = std::string("\"") + exePath + "\" --reader" + (g_quad ? " --quad" : "");
 	STARTUPINFOA si = {sizeof(si)};
 	PROCESS_INFORMATION pi;
 	CHECK(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi), "spawn reader");
@@ -828,7 +902,7 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 
 	HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, L"Local\\QVDTest_ReaderReady");
 	HANDLE done = CreateEventW(nullptr, TRUE, FALSE, L"Local\\QVDTest_FramesDone");
-	std::string cmd = std::string("\"") + exePath + "\" --reader";
+	std::string cmd = std::string("\"") + exePath + "\" --reader" + (g_quad ? " --quad" : "");
 	STARTUPINFOA si = {sizeof(si)};
 	PROCESS_INFORMATION pi;
 	CHECK(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi), "spawn reader");
@@ -838,8 +912,9 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 		uint32_t idx;
 		AcquireSwapchainImage(sc, nullptr, &idx);
 		ReleaseSwapchainImage(sc, nullptr);
-		XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
-							      {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+		XrCompositionLayerProjectionView views[4] = {
+			{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+			{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
 		for (uint32_t v = 0; v < 2; v++) {
 			views[v].subImage.swapchain = sc;
 			views[v].subImage.imageRect = {{RECT_X, RECT_Y}, {(int32_t)RECT_W, (int32_t)RECT_H}};
@@ -847,8 +922,15 @@ static int RunWriterD3D12(const char *exePath, const char *layerPath)
 			views[v].pose = {POSE_Q, {0, 0, 0}};
 			views[v].fov = POSE_FOV;
 		}
+		for (uint32_t v = 2; v < 4; v++) { // the inner views (quad views)
+			views[v].subImage.swapchain = sc;
+			views[v].subImage.imageRect = {{INNER_X, INNER_Y}, {(int32_t)INNER_W, (int32_t)INNER_H}};
+			views[v].subImage.imageArrayIndex = v == 2 ? 1u : 0u;
+			views[v].pose = {INNER_Q, {0, 0, 0}};
+			views[v].fov = INNER_FOV;
+		}
 		XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-		proj.viewCount = 2;
+		proj.viewCount = g_quad ? 4 : 2;
 		proj.space = space;
 		proj.views = views;
 		const XrCompositionLayerBaseHeader *layers[] = {(const XrCompositionLayerBaseHeader *)&proj};
@@ -993,6 +1075,9 @@ int main(int argc, char **argv)
 	// own channel name for this test and its child processes: never the real one of a running game/OBS
 	if (!GetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", nullptr, 0))
 		SetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_CHANNEL", L"Local\\ArchanVRCapture_TestChannel");
+	for (int i = 1; i < argc; i++)
+		if (strcmp(argv[i], "--quad") == 0)
+			g_quad = true;
 	if (argc >= 2 && strcmp(argv[1], "--reader") == 0)
 		return RunReader();
 	if (argc >= 2 && strcmp(argv[1], "--idle") == 0) {
@@ -1007,6 +1092,8 @@ int main(int argc, char **argv)
 		printf("usage: layer_mock_test <layer.dll> [--d3d12] | --crop\n");
 		return 2;
 	}
+	if (g_quad)
+		printf("quad views mode: the mock game submits 4 views\n");
 	if (argc >= 3 && strcmp(argv[2], "--cost") == 0)
 		g_costTest = true;
 	if (argc >= 3 && strcmp(argv[2], "--d3d12") == 0)

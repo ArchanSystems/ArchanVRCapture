@@ -6,7 +6,11 @@ are set up in OBS's own audio settings.
 Where the picture comes from (first one that has a picture wins):
 1. **OpenXR games** on any runtime (Virtual Desktop VDXR, Pimax, SteamVR OpenXR):
    the game's own left eye, through the Archan VR Capture OpenXR layer. PimaxHome is skipped.
-   Pimax quad views: view 0 = the wide left view.
+   Quad views (foveated rendering, 4 views, e.g. Pimax with eye tracking): the wide left view
+   (view 0) with the sharp inner left view (view 2) put into it where it belongs, like the headset
+   shows it; with eye-tracked foveation the sharp area moves with the eyes. The combined picture has
+   the inner view's sharpness over the whole wide FOV, but no larger than HMD res can use (its 16:9
+   crop at most 4096 wide); the OBS log line `quad views: combined picture …` gives its size.
 2. **SteamVR games (OpenVR)**: SteamVR's left eye mirror texture, read by OBS as a
    background SteamVR app (never starts SteamVR, no mirror window). This is SteamVR's
    composited image, so SteamVR overlays (dashboard) show in it.
@@ -17,7 +21,7 @@ Where the picture comes from (first one that has a picture wins):
 |---|---|---|
 | OpenXR layer | `layer/layer.cpp` → `XR_APILAYER_ARCHAN_vr_capture.dll` | Runs inside the game. On every frame it copies the **left eye** image (view 0 of the projection layer) into a GPU shared texture. It copies only while OBS is showing the source. |
 | OBS plugin | `obs-plugin/plugin.cpp` → `archan-vr-capture.dll` (+ `openvr_api.dll`, OpenVR SDK v2.15.6) | Source **"Archan VR Capture"**. Shows the **centre 16:9 crop** of the left eye, filling the canvas. |
-| Resolution picker | in the source's Properties | **HMD res (automatic)** (default): canvas and output = the exact 16:9 crop of the left eye, 1:1 pixels (2496×1404 for a 2496×2688 eye), following the eye size by itself. **1080p**: 1920×1080. Only the canvas and output resolution of the active profile are changed, and only while no recording/stream/replay buffer/virtual camera is running. |
+| Resolution picker | in the source's Properties | **HMD res (automatic)** (default): canvas and output = the exact 16:9 crop of the left eye, 1:1 pixels (2496×1404 for a 2496×2688 eye), following the eye size by itself, **at most 4096×2304** (user decision 2026-11-06: NVENC H.264 encodes at most 4096 wide, HEVC 8192 — measured with OBS's `obs-nvenc-test` on an RTX 3090; a 5888×3312 quad views picture failed to record). **1440p**: 2560×1440. **1080p**: 1920×1080. Only the canvas and output resolution of the active profile are changed, and only while no recording/stream/replay buffer/virtual camera is running. |
 
 ## Stabilization (source Properties → "Stabilization")
 
@@ -92,6 +96,30 @@ within worst mean 0.29–0.45 / max 2 colour levels. Phase D: audio offsets 50/0
 
 ## Build / install
 
+**Release installer (signed), for testers and users:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\packaging\make_release.ps1 -Version 0.1.0
+# -> E:\ArchanVRCapture_Release_Installer\ArchanVRCapture-0.1.0-Setup.exe
+```
+
+Build, all tests, explicit stage, sign + prove our two DLLs, payload hashes
+(`payload.manifest.txt`), Inno Setup (`tools\packaging\ArchanVRCapture.iss`, signs Setup and the
+uninstaller), final check; an installer that fails it is renamed `.UNSIGNED`. Signing is the same
+system as Archan XR: `tools\packaging\sign_release.ps1` is Archan XR's script (Microsoft
+Artifact Signing, signer Archan Systems AS, SHA-256, RFC 3161 timestamp), except that the Azure
+tenant and subscription are read from `tools\packaging\signing_login.local.json` (not in git:
+`{ "tenant": "<id>", "subscription": "<id>" }`). Needs Inno Setup 6, the
+Artifact Signing Client Tools, `D:\ArchanXR\signing\metadata.json` and `az login`
+(contact@archansystems.com). Only Archan Systems can sign; anyone can build and install unsigned
+with `build.ps1` and `install.ps1`. Valve's `openvr_api.dll` is shipped as Valve built it.
+The installer needs no admin rights, closes OBS (asked first, so it saves), the simulators and
+Pimax/OFXR after naming them, and installs to the same places as `install.ps1`. Its uninstaller
+gives every audio source its own Sync Offset back, removes the files and the layer registration,
+and keeps `logs\`.
+
+**Development install** (unsigned build output, same places):
+
 ```powershell
 .\build.ps1      # VS 18 + CMake; makes import libs from the installed OBS DLLs
 .\install.ps1    # close OBS first; no admin needed
@@ -146,6 +174,7 @@ build\layer_mock_test.exe --cleanup   # log cleanup on a temporary folder (48 h 
 build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll
 build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll --cost   # + the cost log line (~10 s at 90 Hz)
 build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll --d3d12
+build\layer_mock_test.exe build\XR_APILAYER_ARCHAN_vr_capture.dll --quad          # quad views (also with --d3d12)
 build\stab_test.exe
 build\stab_replay.exe <poses.csv> out.csv <crop %> <delay s> <smoothness> <horizon 0|1> [fps]   # env STAB_SKIP=0.1: 10 % of OBS frames skipped
 # run from C:\Program Files\obs-studio\bin\64bit:
@@ -160,3 +189,14 @@ build\plugin_render_test.exe build\archan-vr-capture.dll obs-plugin\data
 | `deps/openxr-sdk` | https://github.com/KhronosGroup/OpenXR-SDK | release-1.1.65 | 24a1f2b92d212501a2b1b8d30ffd53abf55fcfa8 | include/openxr |
 | `deps/openvr` | https://github.com/ValveSoftware/openvr | v2.15.6 | 0924064316de3effbcd1acf1e309182a2deb1c05 | headers, bin/win64/openvr_api.dll |
 | `deps/openxr-docs` | https://github.com/KhronosGroup/OpenXR-Docs | release-1.1.65 | 18ebc0374da23c020ef4c949f9b144ffae6160ef | spec text only (khr_d3d12_enable.adoc: D3D12 image states) |
+
+## License
+
+Copyright (C) 2026 Archan Systems AS.
+
+This program is free software; you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation; either version 2 of the
+License, or (at your option) any later version. See [LICENSE](LICENSE).
+
+Third-party parts keep their own licenses: OBS Studio (GPL-2.0-or-later), OpenXR SDK headers (Apache-2.0 OR MIT),
+OpenVR SDK and its `openvr_api.dll` (BSD-3-Clause, shipped as Valve built it).
