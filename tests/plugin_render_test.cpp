@@ -239,6 +239,15 @@ int main(int argc, char **argv)
 	obs_source_t *src = obs_source_create("archan_vr_capture", "Archan VR Capture", initial, nullptr);
 	obs_data_release(initial);
 	CHECK(src, "source create");
+	{ // the defaults a new source gets (user decisions: smoothness 100, crop 15 %, delay 0.20 s)
+		obs_data_t *def = obs_get_source_defaults("archan_vr_capture");
+		const long long sm = obs_data_get_int(def, "stab_smooth");
+		const double cr = obs_data_get_double(def, "stab_crop"), dl = obs_data_get_double(def, "stab_delay");
+		const bool on = obs_data_get_bool(def, "stab_enable");
+		obs_data_release(def);
+		printf("defaults: stabilization %s, smoothness %lld, crop %.1f %%, delay %.2f s\n", on ? "on" : "off", sm, cr, dl);
+		CHECK(on && sm == 100 && cr == 15.0 && dl == 0.20, "defaults are not on / 100 / 15 / 0.20");
+	}
 
 	// rename: new id + display name; the old ids still load (old scenes) but are hidden (deprecated)
 	const char *shown = obs_source_get_display_name("archan_vr_capture");
@@ -727,6 +736,9 @@ int main(int argc, char **argv)
 			obs_data_release(sd);
 			Sleep(1300); // video sources apply updates on their next tick; the plugin re-checks once a second
 		};
+		// live = in the Program output (user decision 2026-11-06: not live -> own offsets back)
+		obs_set_output_source(0, src);
+		Sleep(300);
 		setStab(false, 0.5);
 		obs_source_t *mic = obs_source_create("archan_test_audio", "Mic", nullptr, nullptr);
 		obs_source_t *desk = obs_source_create("archan_test_audio", "Desktop", nullptr, nullptr);
@@ -761,10 +773,19 @@ int main(int argc, char **argv)
 		CHECK(ms(mic) == 50 && ms(desk) == 100 && ms(game) == 0, "off: expected own offsets 50 / 100 / 0");
 		setStab(true, 1.0);
 		CHECK(ms(mic) == 1050 && ms(desk) == 1100 && ms(game) == 1000, "on, 1.0 s: expected 1050 / 1100 / 1000");
+		obs_set_output_source(0, nullptr); // left Program (another scene, or the eye icon off)
+		Sleep(1300);
+		printf("phase D not live: mic %lld, desktop %lld, game %lld ms\n", ms(mic), ms(desk), ms(game));
+		CHECK(ms(mic) == 50 && ms(desk) == 100 && ms(game) == 0, "not live: expected own offsets 50 / 100 / 0");
+		obs_set_output_source(0, src); // live again
+		Sleep(1300);
+		printf("phase D live again: mic %lld, desktop %lld, game %lld ms\n", ms(mic), ms(desk), ms(game));
+		CHECK(ms(mic) == 1050 && ms(desk) == 1100 && ms(game) == 1000, "live again: expected 1050 / 1100 / 1000");
 		obs_source_remove(src); // the VR source is removed from OBS
 		Sleep(300);
 		printf("phase D VR source removed: mic %lld, desktop %lld, game %lld ms\n", ms(mic), ms(desk), ms(game));
 		CHECK(ms(mic) == 50 && ms(desk) == 100 && ms(game) == 0, "removed: expected own offsets 50 / 100 / 0");
+		obs_set_output_source(0, nullptr);
 		obs_source_release(mic);
 		obs_source_release(desk);
 		obs_source_release(game);
@@ -795,7 +816,9 @@ int main(int argc, char **argv)
 		printf("pose recorder: %s, %llu rows (plugin said %llu, phases C + E sent %d), last row %s q %.6f %.6f %.6f %.6f\n",
 		       g_posePath.c_str(), rows, g_poseRows, framesC, src, q[0], q[1], q[2], q[3]);
 		CHECK(headerOk, "recorder header");
-		CHECK(rows == g_poseRows && rows == (unsigned long long)framesC, "row count");
+		// + 1: the "back to one view" picture after phase F is rendered by OBS's own output in phase D
+		// (the source is live there), so it is recorded too
+		CHECK(rows == g_poseRows && rows == (unsigned long long)framesC + 1, "row count");
 		CHECK(n == 7 && strcmp(src, "openxr") == 0, "last row parse");
 		CHECK(std::fabs(q[0] - lastQaC.x) < 1e-6 && std::fabs(q[1] - lastQaC.y) < 1e-6 &&
 			      std::fabs(q[2] - lastQaC.z) < 1e-6 && std::fabs(q[3] - lastQaC.w) < 1e-6,

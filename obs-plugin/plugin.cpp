@@ -150,6 +150,10 @@ struct QvdSource {
 	bool stabLoggedStart = false;
 	PoseRecorder recorder; // render thread only
 	std::atomic<bool> removed{false}; // removed from OBS (audio sync goes back)
+	// live = in OBS's Program output (activate/deactivate; a hidden scene item is not live). User decision
+	// 2026-11-06: not live -> audio sync goes back; no VR picture does not count.
+	std::atomic<bool> live{false};
+	std::atomic<int64_t> delayNs{0}; // video delay while stabilization is on, else 0
 	// cost measurement (render thread): this source's CPU time per render, logged every 10 s
 	struct Cost {
 		uint64_t windowNs = 0;
@@ -895,8 +899,8 @@ void KeepVideoSize(QvdSource *s);
 
 // ---------------------------------------------------------------- audio sync (user decision 2026-11-05)
 // While a VR source has stabilization on, every audio source's Sync Offset = its own offset + the
-// video delay (the largest delay of the VR sources that are on). Stabilization off or the VR source
-// removed: every audio source gets its own offset back. Own offset = what is shown minus the delay
+// video delay (the largest delay of the VR sources that are on and live in Program). Stabilization off,
+// the VR source not live (2026-11-06) or removed: every audio source gets its own offset back. Own offset = what is shown minus the delay
 // the plugin added, so an offset the user types meanwhile is kept as theirs (+ the delay).
 // OBS saves the scene collection at exit while the delay is still applied, so the own offsets are
 // saved with it (module data) and taken back on load, only where the saved Sync Offset is still
@@ -1000,6 +1004,12 @@ void AudioWant(const void *key, int64_t ns)
 			g_audio.want.erase(key);
 	}
 	AudioQueue();
+}
+
+// this VR source's want: its delay only while stabilization is on, it is live and not removed
+void AudioRefresh(QvdSource *s)
+{
+	AudioWant(s, s->live && !s->removed ? s->delayNs.load() : 0);
 }
 
 // Scene collection save / load (UI thread). 'data' = this collection's module data.
@@ -1447,7 +1457,8 @@ void qvd_update(void *data, obs_data_t *settings)
 		s->stabSettings = st;
 		s->stabDirty = true;
 	}
-	AudioWant(s, st.enable && !s->removed ? (int64_t)std::llround(st.delay * 1e9) : 0);
+	s->delayNs = st.enable ? (int64_t)std::llround(st.delay * 1e9) : 0;
+	AudioRefresh(s);
 	LOG(LOG_INFO, "stabilization: %s, smoothness %.0f, keep horizon level %s, crop %.1f %%, video delay %.2f s",
 	    st.enable ? "on" : "off", st.smooth, st.horizon ? "yes" : "no", st.crop, st.delay);
 }
@@ -1457,6 +1468,23 @@ void qvd_removed(void *data, calldata_t *)
 	QvdSource *s = static_cast<QvdSource *>(data);
 	s->removed = true;
 	AudioWant(s, 0);
+}
+
+// OBS video thread: the source entered / left the Program output (scene switch, eye icon)
+void qvd_activate(void *data)
+{
+	QvdSource *s = static_cast<QvdSource *>(data);
+	s->live = true;
+	LOG(LOG_INFO, "live in Program: audio sync follows the video delay");
+	AudioRefresh(s);
+}
+
+void qvd_deactivate(void *data)
+{
+	QvdSource *s = static_cast<QvdSource *>(data);
+	s->live = false;
+	LOG(LOG_INFO, "not live in Program: audio sources get their own offsets back");
+	AudioRefresh(s);
 }
 
 void *qvd_create(obs_data_t *settings, obs_source_t *source)
@@ -1478,7 +1506,7 @@ void qvd_video_tick(void *data, float)
 		on = s->stabSettings.enable;
 	}
 	const uint64_t now = os_gettime_ns();
-	if (on && !s->removed && now - s->audioCheckNs >= 1000000000ull) {
+	if (on && s->live && !s->removed && now - s->audioCheckNs >= 1000000000ull) {
 		s->audioCheckNs = now;
 		AudioQueue();
 	}
@@ -1766,7 +1794,7 @@ void qvd_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "resolution", MODE_HMD);
 	obs_data_set_default_bool(settings, "stab_enable", true);
-	obs_data_set_default_int(settings, "stab_smooth", 50);
+	obs_data_set_default_int(settings, "stab_smooth", 100); // user decision 2026-11-06
 	obs_data_set_default_bool(settings, "stab_horizon", false);
 	obs_data_set_default_double(settings, "stab_crop", 15.0);  // user decision 2026-11-05 after VD/Q3 test
 	obs_data_set_default_double(settings, "stab_delay", 0.20); // user decision 2026-11-05 after VD/Q3 test
@@ -1790,6 +1818,8 @@ bool obs_module_load(void)
 	info.get_properties = qvd_get_properties;
 	info.get_defaults = qvd_get_defaults;
 	info.update = qvd_update;
+	info.activate = qvd_activate;
+	info.deactivate = qvd_deactivate;
 	info.icon_type = OBS_ICON_TYPE_GAME_CAPTURE;
 	obs_register_source(&info);
 
