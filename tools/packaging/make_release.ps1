@@ -82,10 +82,16 @@ if (-not $SkipTests) {
     Run-Test 'stabilizer' (Join-Path $build 'stab_test.exe') @() $root
     Run-Test 'crop' $mock @('--crop') $root
     Run-Test 'log cleanup' $mock @('--cleanup') $root
+    Run-Test 'log zip' $mock @('--logzip') $root
     Run-Test 'layer D3D11' $mock @("`"$layerDll`"") $root
     Run-Test 'layer D3D12' $mock @("`"$layerDll`"", '--d3d12') $root
     Run-Test 'layer quad views D3D11' $mock @("`"$layerDll`"", '--quad') $root
     Run-Test 'layer quad views D3D12' $mock @("`"$layerDll`"", '--d3d12', '--quad') $root
+    Run-Test 'layer right eye quad D3D11' $mock @("`"$layerDll`"", '--quad', '--right') $root
+    Run-Test 'layer right eye quad D3D12' $mock @("`"$layerDll`"", '--d3d12', '--quad', '--right') $root
+    Run-Test 'overlay D3D11' $mock @("`"$layerDll`"", '--overlay') $root
+    Run-Test 'overlay D3D12' $mock @("`"$layerDll`"", '--overlay', '--d3d12') $root
+    Run-Test 'settings window' $mock @('--settings-app', "`"$(Join-Path $build 'ArchanVRCaptureSettings.exe')`"") $root
     Run-Test 'plugin in libobs' (Join-Path $build 'plugin_render_test.exe') @("`"$(Join-Path $build 'archan-vr-capture.dll')`"", "`"$(Join-Path $root 'obs-plugin\data')`"") $ObsBin
 }
 
@@ -95,6 +101,7 @@ if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -F
 $files = @(
     @{ From = 'build\XR_APILAYER_ARCHAN_vr_capture.dll';      To = 'layer\XR_APILAYER_ARCHAN_vr_capture.dll'; Sign = $true },
     @{ From = 'layer\XR_APILAYER_ARCHAN_vr_capture.json';     To = 'layer\XR_APILAYER_ARCHAN_vr_capture.json' },
+    @{ From = 'build\ArchanVRCaptureSettings.exe';            To = 'ArchanVRCaptureSettings.exe'; Sign = $true },
     @{ From = 'build\archan-vr-capture.dll';                  To = 'obs-plugin\bin\64bit\archan-vr-capture.dll'; Sign = $true },
     @{ From = 'build\openvr_api.dll';                         To = 'obs-plugin\bin\64bit\openvr_api.dll' },
     @{ From = 'obs-plugin\data\locale\en-US.ini';             To = 'obs-plugin\data\locale\en-US.ini' },

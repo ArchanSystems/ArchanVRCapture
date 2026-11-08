@@ -13,13 +13,18 @@
 ;  ISCC run without that definition stops with an error: no unsigned
 ;  installer by accident.
 ;
+;  ONE KIND OF INSTALL: the layer (with the performance overlay) + the OBS capture plugin. The
+;  "Overlay only" install was removed (user decision 2026-11-07, "remove the standalone for now").
+;
 ;  WHAT GOES WHERE (the same places install.ps1 has always used)
 ;    {app} = %LOCALAPPDATA%\ArchanVRCapture
 ;      layer\    the OpenXR API layer + its manifest, registered for this
 ;                user (HKCU implicit layers)
-;      tools\    restore_audio_sync.ps1, run by the uninstaller
+;      ArchanVRCaptureSettings.exe   the settings window (overlay on/off + key), Start menu
+;      tools\    restore_audio_sync.ps1, run by the uninstaller (full install)
 ;      logs\     written at run time, NOT installed and NOT removed
-;    %ProgramData%\obs-studio\plugins\archan-vr-capture\   the OBS plugin
+;      overlay.ini  the overlay settings, written at run time, NOT removed
+;    %ProgramData%\obs-studio\plugins\archan-vr-capture\   the OBS plugin (full install)
 ;  No admin rights are needed: Users may create folders in ProgramData.
 
 #define MyAppName "Archan VR Capture"
@@ -69,9 +74,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ApplicationsFound=These programs are using Archan VR Capture's files and must be closed before Setup can continue. They are usually OBS, a simulator, Pimax Home or another VR program. Please close them yourself, or let Setup close them for you, then start them again after the installation.
 
 [Files]
-; Our two binaries, signed by make_release.ps1; `signcheck` makes the compiler refuse an unsigned one.
+; Our binaries, signed by make_release.ps1; `signcheck` makes the compiler refuse an unsigned one.
 Source: "{#MyStage}\layer\XR_APILAYER_ARCHAN_vr_capture.dll"; DestDir: "{app}\layer"; Flags: ignoreversion signcheck
 Source: "{#MyStage}\layer\{#MyLayerJson}"; DestDir: "{app}\layer"; Flags: ignoreversion
+Source: "{#MyStage}\ArchanVRCaptureSettings.exe"; DestDir: "{app}"; Flags: ignoreversion signcheck
 Source: "{#MyStage}\obs-plugin\bin\64bit\archan-vr-capture.dll"; DestDir: "{#MyPluginDir}\bin\64bit"; Flags: ignoreversion signcheck
 ; Valve's OpenVR loader (SteamVR mirror path): third party, shipped as Valve built it, never re-signed.
 Source: "{#MyStage}\obs-plugin\bin\64bit\openvr_api.dll"; DestDir: "{#MyPluginDir}\bin\64bit"; Flags: ignoreversion
@@ -79,6 +85,9 @@ Source: "{#MyStage}\obs-plugin\data\locale\en-US.ini"; DestDir: "{#MyPluginDir}\
 Source: "{#MyStage}\tools\restore_audio_sync.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "{#MyStage}\third_party\*"; DestDir: "{app}\third_party"; Flags: ignoreversion recursesubdirs
 Source: "{#MyStage}\payload.manifest.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autoprograms}\Archan VR Capture Settings"; Filename: "{app}\ArchanVRCaptureSettings.exe"
 
 [InstallDelete]
 ; The installs from before the renames (install.ps1 removed them the same way).
@@ -131,8 +140,8 @@ end;
 { ---------------------------------------------------------------- }
 procedure HolderList(var Exes, Names: TArrayOfString);
 begin
-  SetArrayLength(Exes, 9);
-  SetArrayLength(Names, 9);
+  SetArrayLength(Exes, 10);
+  SetArrayLength(Names, 10);
   Exes[0] := 'obs64.exe';                     Names[0] := 'OBS Studio';
   Exes[1] := 'DCS.exe';                       Names[1] := 'DCS World';
   Exes[2] := 'FlightSimulator2024.exe';       Names[2] := 'Microsoft Flight Simulator 2024';
@@ -142,6 +151,7 @@ begin
   Exes[6] := 'PimaxClient.exe';               Names[6] := 'Pimax Client';
   Exes[7] := 'PimaxToolkit.exe';              Names[7] := 'Pimax Toolkit';
   Exes[8] := 'OFXRBridgeTray.exe';            Names[8] := 'OFXR Bridge';
+  Exes[9] := 'ArchanVRCaptureSettings.exe';   Names[9] := 'Archan VR Capture Settings';
 end;
 
 function IsRunning(const Exe: string): Boolean;

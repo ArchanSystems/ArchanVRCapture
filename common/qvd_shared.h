@@ -3,8 +3,9 @@
 // projection layer, copied into a D3D11 shared texture with a keyed mutex.
 #pragma once
 #include <stdint.h>
+#include <stdio.h>
 
-#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v3"
+#define QVD_SHM_NAME L"Local\\ArchanVRCapture_Picture_v4"
 
 /* Channel name. Tests set ARCHAN_VRCAPTURE_TEST_CHANNEL in their own processes so they never
  * touch the real channel of a running game or OBS. Requires <windows.h> before this header. */
@@ -18,8 +19,25 @@ static inline const wchar_t *qvd_channel_name(void)
 	}
 	return name;
 }
+/* "OBS is running": the OBS plugin holds a mutex with this name while OBS runs (user decision 2026-11-07:
+ * the overlay is shown by default while OBS runs). Derived from the channel name, so tests stay apart. */
+static inline const wchar_t *qvd_obs_presence_name(void)
+{
+	static wchar_t name[160];
+	if (!name[0])
+		swprintf_s(name, 160, L"%s_OBS", qvd_channel_name());
+	return name;
+}
+
 #define QVD_MAGIC 0x31445651u /* "QVD1" */
-#define QVD_VERSION 3u /* v2: per-frame pose for stabilization; v3: quad views inner view */
+#define QVD_VERSION 5u /* v2: per-frame pose for stabilization; v3: quad views inner view; v4: performance overlay;
+                          v5: left / right eye */
+
+/* Performance overlay panel (v4): RGBA8, premultiplied alpha, top row first. */
+#define QVD_OVERLAY_W 640u
+#define QVD_OVERLAY_H 196u
+/* OBS stops drawing the panel when the layer has not updated it for this long (it updates once a second). */
+#define QVD_OVERLAY_TIMEOUT_MS 3000ull
 
 /* Writer stops copying when OBS has not rendered the source for this long. */
 #define QVD_READER_TIMEOUT_MS 2000ull
@@ -68,6 +86,20 @@ struct QvdShared {
 	uint32_t innerDxgiFormat;
 	float innerFovTan[4];     /* tan(left) tan(right) tan(up) tan(down) of the inner image */
 	float innerPoseOrient[4]; /* x y z w, same space as poseOrient */
+
+	/* v4: performance overlay (user decision 2026-11-06: toggled by a key in the game, shown in the headset
+	 * and in the recording). overlayVisible: the game's overlay is on. The panel pixels are written when they
+	 * change (once a second) under their own seqlock overlaySeq (odd while writing). */
+	volatile uint32_t overlayVisible;
+	volatile uint32_t overlaySeq;
+	volatile uint64_t overlayTickMs; /* GetTickCount64() at the last panel write */
+	uint8_t overlayPixels[QVD_OVERLAY_W * QVD_OVERLAY_H * 4];
+
+	/* v5: which eye (user decision 2026-11-07: an option in the OBS source). wantEye: written by OBS with
+	 * readerTickMs, 0 = left (views 0 and inner 2), 1 = right (views 1 and inner 3). picEye: the eye of the
+	 * texture content, written by the layer with the pose (under the keyed mutex). */
+	volatile uint32_t wantEye;
+	volatile uint32_t picEye;
 };
 #pragma pack(pop)
 

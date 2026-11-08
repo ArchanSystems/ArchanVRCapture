@@ -27,6 +27,7 @@
 #include <util/base.h>
 
 #include "../common/qvd_shared.h"
+#include "../common/overlay_key.h"
 #include "../obs-plugin/stabilizer.h"
 
 static const uint32_t EYE_W = 2496, EYE_H = 2688; // DCS on VDXR, layer.log 2026-11-05
@@ -229,6 +230,21 @@ int main(int argc, char **argv)
 	// In OBS this DLL sits next to obs64.exe; this test exe lives elsewhere, so preload it.
 	CHECK(LoadLibraryW(L"C:/Program Files/obs-studio/bin/64bit/obs-frontend-api.dll"), "obs-frontend-api.dll");
 	SetEnvironmentVariableA("ARCHAN_VRCAPTURE_TEST_RECORDING", "1"); // the head motion recorder runs
+	// the overlay key file of this test only (never the user's real one)
+	wchar_t keyFile[MAX_PATH];
+	ExpandEnvironmentStringsW(L"%TEMP%\\archan_render_test_overlay.ini", keyFile, MAX_PATH);
+	DeleteFileW(keyFile);
+	SetEnvironmentVariableW(L"ARCHAN_VRCAPTURE_TEST_SETTINGS", keyFile);
+	auto readKeyFile = [&]() {
+		std::string t;
+		if (FILE *f = _wfopen(keyFile, L"r") /* text mode, as the layer reads it */) {
+			char b[128] = "";
+			const size_t n = fread(b, 1, sizeof(b) - 1, f);
+			fclose(f);
+			t.assign(b, n);
+		}
+		return t;
+	};
 	obs_module_t *mod = nullptr;
 	int mr = obs_open_module(&mod, argv[1], argv[2]);
 	CHECK(mr == MODULE_SUCCESS, "obs_open_module %d", mr);
@@ -239,6 +255,16 @@ int main(int argc, char **argv)
 	obs_source_t *src = obs_source_create("archan_vr_capture", "Archan VR Capture", initial, nullptr);
 	obs_data_release(initial);
 	CHECK(src, "source create");
+	{ // the overlay key (user decision 2026-11-06: default Ctrl+Shift+F, saved for the layer)
+		const std::string k = readKeyFile();
+		printf("overlay key file after create: '%s'\n", k.c_str());
+		CHECK(k == "key=Ctrl+Shift+F\nenabled=0\n", "settings file is not the default key, off (user decision 2026-11-07)");
+		// "OBS is running" for the layer (user decision 2026-11-07)
+		HANDLE pres = OpenMutexW(SYNCHRONIZE, FALSE, qvd_obs_presence_name());
+		printf("presence mutex '%ls': %s\n", qvd_obs_presence_name(), pres ? "held" : "MISSING");
+		CHECK(pres, "the plugin does not hold the presence mutex");
+		CloseHandle(pres);
+	}
 	{ // the defaults a new source gets (user decisions: smoothness 100, crop 15 %, delay 0.20 s)
 		obs_data_t *def = obs_get_source_defaults("archan_vr_capture");
 		const long long sm = obs_data_get_int(def, "stab_smooth");
@@ -281,6 +307,12 @@ int main(int argc, char **argv)
 		      strcmp(obs_property_list_item_string(list, 2), "1920x1080") == 0,
 	      "picker values");
 	CHECK(!obs_properties_get(props, "apply"), "Apply button should be gone");
+	CHECK(obs_properties_get(props, "overlay_key") && obs_properties_get(props, "overlay_info"), "overlay key field");
+	CHECK(obs_properties_get(props, "overlay_enabled") && obs_properties_get(props, "eye"), "overlay checkbox / eye list");
+	CHECK(obs_properties_get(props, "save_logs") &&
+		      obs_property_get_type(obs_properties_get(props, "save_logs")) == OBS_PROPERTY_BUTTON &&
+		      obs_properties_get(props, "save_logs_info"),
+	      "Save logs button");
 	obs_properties_destroy(props);
 
 	const QvdRect c = qvd_center_crop_16x9(EYE_W, EYE_H);
@@ -312,6 +344,93 @@ int main(int argc, char **argv)
 	       (unsigned long long)bad, g_requests.size());
 	CHECK(bad == 0, "phase A picture");
 	CHECK(g_requests.empty(), "1920 mode at 1920x1080 must not ask for a change");
+
+	// ------------------------------------------------ phase O: performance overlay in the recording
+	// The game's panel: left half opaque white, right half fully transparent (premultiplied RGBA).
+	// Expected at 1080p: top left at 24,24, the panel at scale 0.8: white on the left half, the picture
+	// unchanged everywhere else. Off, or not updated for 3 s: no panel.
+	const double pw = QVD_OVERLAY_W * 0.8, ph = QVD_OVERLAY_H * 0.8;
+	{
+		const std::vector<uint8_t> plain = out;
+		for (uint32_t y = 0; y < QVD_OVERLAY_H; y++)
+			for (uint32_t x = 0; x < QVD_OVERLAY_W; x++) {
+				uint8_t *q = &shm->overlayPixels[((size_t)y * QVD_OVERLAY_W + x) * 4];
+				const uint8_t v = x < QVD_OVERLAY_W / 2 ? 255 : 0;
+				q[0] = q[1] = q[2] = q[3] = v;
+			}
+		shm->overlaySeq = 2;
+		shm->overlayTickMs = GetTickCount64();
+		shm->overlayVisible = 1;
+		auto check = [&](bool panel, const char *what) -> int {
+			uint64_t badIn = 0, badOut = 0;
+			for (uint32_t v = 0; v < 1080; v++)
+				for (uint32_t u = 0; u < 1920; u++) {
+					const uint8_t *p = &out[((size_t)v * 1920 + u) * 4], *q = &plain[((size_t)v * 1920 + u) * 4];
+					const bool white = panel && u >= 24 + 2 && u < 24 + pw / 2 - 2 && v >= 24 + 2 && v < 24 + ph - 2;
+					const bool edge = panel && u >= 24 - 2 && u < 24 + pw / 2 + 2 && v >= 24 - 2 && v < 24 + ph + 2 && !white;
+					if (edge)
+						continue; // filtered border pixels
+					if (white) {
+						if (p[0] != 255 || p[1] != 255 || p[2] != 255)
+							badIn++;
+					} else if (memcmp(p, q, 4) != 0) {
+						badOut++;
+					}
+				}
+			printf("phase O (%s): %llu panel pixels not white, %llu other pixels changed\n", what,
+			       (unsigned long long)badIn, (unsigned long long)badOut);
+			return badIn == 0 && badOut == 0 ? 0 : 1;
+		};
+		CHECK(Render(src, 1920, 1080, out), "render O1");
+		CHECK(check(true, "on") == 0, "overlay on");
+		shm->overlayVisible = 0;
+		CHECK(Render(src, 1920, 1080, out), "render O2");
+		CHECK(check(false, "off") == 0, "overlay off");
+		shm->overlayVisible = 1;
+		shm->overlayTickMs = GetTickCount64() - QVD_OVERLAY_TIMEOUT_MS - 100;
+		CHECK(Render(src, 1920, 1080, out), "render O3");
+		CHECK(check(false, "on but not updated for 3.1 s") == 0, "stale overlay");
+		shm->overlayVisible = 0;
+		out = plain;
+	}
+
+	// ------------------------------------------------ phase K: overlay key field -> key file
+	{
+		// the switch was turned off in the settings window: OBS saving a key must keep it off
+		FILE *sw = _wfopen(keyFile, L"w");
+		CHECK(sw, "write settings");
+		fputs("key=Ctrl+Shift+F\nenabled=0\n", sw);
+		fclose(sw);
+		obs_data_t *k = obs_data_create();
+		obs_data_set_string(k, "overlay_key", " alt + f10 ");
+		obs_source_update(src, k);
+		Sleep(300);
+		const std::string a = readKeyFile();
+		obs_data_set_string(k, "overlay_key", "Ctrl+");
+		obs_source_update(src, k);
+		Sleep(300);
+		const std::string b = readKeyFile();
+		obs_data_set_string(k, "overlay_key", QVD_OVERLAY_DEFAULT_KEY);
+		obs_source_update(src, k);
+		Sleep(300);
+		const std::string d = readKeyFile();
+		obs_data_release(k);
+		printf("phase K: ' alt + f10 ' -> '%s', 'Ctrl+' -> '%s', back -> '%s'\n", a.c_str(), b.c_str(), d.c_str());
+		CHECK(a == "key=Alt+F10\nenabled=0\n" && b == a && d == "key=Ctrl+Shift+F\nenabled=0\n", "settings file");
+		// the checkbox (user decision 2026-11-07): on -> enabled=1, off -> enabled=0
+		obs_data_t *c = obs_data_create();
+		obs_data_set_bool(c, "overlay_enabled", true);
+		obs_source_update(src, c);
+		Sleep(300);
+		const std::string on = readKeyFile();
+		obs_data_set_bool(c, "overlay_enabled", false);
+		obs_source_update(src, c);
+		Sleep(300);
+		const std::string off = readKeyFile();
+		obs_data_release(c);
+		printf("phase K: checkbox on -> '%s', off -> '%s'\n", on.c_str(), off.c_str());
+		CHECK(on == "key=Ctrl+Shift+F\nenabled=1\n" && off == "key=Ctrl+Shift+F\nenabled=0\n", "overlay checkbox");
+	}
 
 	// ------------------------------------------------ phase A2: 1440p (user request 2026-11-06)
 	{

@@ -17,6 +17,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <shellapi.h>
 
 #include <openvr.h> // OpenVR SDK v2.15.6 header; openvr_api.dll is loaded at runtime
 
@@ -37,9 +38,12 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "../common/qvd_shared.h"
 #include "../common/log_cleanup.h"
+#include "../common/log_zip.h"
+#include "../common/overlay_key.h"
 #include "stabilizer.h"
 
 OBS_DECLARE_MODULE()
@@ -70,6 +74,7 @@ struct PoseRecorder {
 struct QvdSource {
 	obs_source_t *source = nullptr;
 	std::mutex shmLock; // render thread vs. properties (UI thread)
+	std::atomic<uint32_t> eye{0}; // 0 left, 1 right (the source's "Eye" setting)
 
 	HANDLE shmHandle = nullptr;
 	QvdShared *shm = nullptr;
@@ -97,6 +102,12 @@ struct QvdSource {
 	gs_effect_t *compEffect = nullptr;
 	bool compEffectFailed = false;
 	gs_texture_t *layerPic = nullptr; // the layer picture to show: the composite, or the copy
+
+	// performance overlay: the game's panel (layer, v4), drawn on top while the game shows it
+	gs_texture_t *overlayTex = nullptr;
+	uint32_t overlaySeen = 0xFFFFFFFFu;
+	bool overlayShow = false;
+	std::vector<uint8_t> overlayPx;
 
 	volatile bool modeHmd = true; // set from settings (UI thread), read by render thread
 	volatile uint32_t fixedW = 1920, fixedH = 1080; // the fixed size when not HMD res
@@ -181,6 +192,10 @@ struct MirrorState {
 	uint64_t gen = 0; // +1 whenever tex changes
 };
 MirrorState g_mirror;
+// the eye the sources ask for (0 left, 1 right) and the eye of the mirror texture / geometry now
+std::atomic<int> g_wantEye{0};
+int g_mirrorEye = 0; // worker thread
+vr::EVREye VrEye(int eye) { return eye == 1 ? vr::Eye_Right : vr::Eye_Left; }
 
 // OpenVR interfaces for the render thread (frame pose of the mirror picture). Every OpenVR call
 // is made under callLock. Lock order: graphics, then g_mirror.lock, then g_vr.callLock.
@@ -202,17 +217,18 @@ stab::Q RotationOf(const vr::HmdMatrix34_t &m)
 // worker thread, under g_vr.callLock: what the mirror picture's pose needs besides the frame pose
 void VrReadEyeGeometry()
 {
-	g_vr.eyeToHead = RotationOf(g_vr.sys->GetEyeToHeadTransform(vr::Eye_Left));
+	g_mirrorEye = g_wantEye;
+	g_vr.eyeToHead = RotationOf(g_vr.sys->GetEyeToHeadTransform(VrEye(g_mirrorEye)));
 	float l = -1, r = 1, t = -1, b = 1;
-	g_vr.sys->GetProjectionRaw(vr::Eye_Left, &l, &r, &t, &b);
+	g_vr.sys->GetProjectionRaw(VrEye(g_mirrorEye), &l, &r, &t, &b);
 	// The header does not state the sign convention of top/bottom; the image's top row is 'top':
 	// with y down (top < bottom) tan(up) = -top, with y up tan(up) = top.
 	g_vr.tan[0] = l;
 	g_vr.tan[1] = r;
 	g_vr.tan[2] = (t < b) ? -t : t;
 	g_vr.tan[3] = (t < b) ? -b : b;
-	LOG(LOG_INFO, "SteamVR left eye: projection raw l %.4f r %.4f t %.4f b %.4f -> tan up %.4f down %.4f", l, r, t, b,
-	    g_vr.tan[2], g_vr.tan[3]);
+	LOG(LOG_INFO, "SteamVR %s eye: projection raw l %.4f r %.4f t %.4f b %.4f -> tan up %.4f down %.4f",
+	    g_mirrorEye ? "right" : "left", l, r, t, b, g_vr.tan[2], g_vr.tan[3]);
 }
 std::thread g_vrThread;
 std::atomic<bool> g_vrStop{false};
@@ -288,7 +304,7 @@ int MirrorGet(vr::IVRCompositor *comp)
 	if (dev) {
 		{
 			std::lock_guard<std::mutex> c(g_vr.callLock);
-			result = (int)comp->GetMirrorTextureD3D11(vr::Eye_Left, dev, &srv);
+			result = (int)comp->GetMirrorTextureD3D11(VrEye(g_mirrorEye), dev, &srv);
 		}
 		if (result == 0 && srv) {
 			ID3D11Resource *res = nullptr;
@@ -309,8 +325,8 @@ int MirrorGet(vr::IVRCompositor *comp)
 				g_mirror.samples = d.SampleDesc.Count;
 				g_mirror.fmt = d.Format;
 				g_mirror.gen++;
-				LOG(LOG_INFO, "SteamVR mirror left eye %ux%u dxgi format %d (mips %u, array %u, samples %u)",
-				    d.Width, d.Height, (int)d.Format, d.MipLevels, d.ArraySize, d.SampleDesc.Count);
+				LOG(LOG_INFO, "SteamVR mirror %s eye %ux%u dxgi format %d (mips %u, array %u, samples %u)",
+				    g_mirrorEye ? "right" : "left", d.Width, d.Height, (int)d.Format, d.MipLevels, d.ArraySize, d.SampleDesc.Count);
 			} else {
 				std::lock_guard<std::mutex> c(g_vr.callLock);
 				comp->ReleaseMirrorTextureD3D11(srv);
@@ -385,6 +401,15 @@ void VrThread()
 				connected = false;
 				nextTry = now + 5000;
 				continue;
+			}
+			if (g_wantEye != g_mirrorEye) { // the source switched eyes: the other mirror texture and geometry
+				LOG(LOG_INFO, "SteamVR mirror: switching to the %s eye", g_wantEye ? "right" : "left");
+				MirrorDrop(comp);
+				{
+					std::lock_guard<std::mutex> c(g_vr.callLock);
+					VrReadEyeGeometry();
+				}
+				nextMirrorTry = 0;
 			}
 			bool have;
 			{
@@ -552,6 +577,8 @@ void CloseShm(QvdSource *s)
 		s->shmHandle = nullptr;
 	}
 	s->seenSeq = 0xFFFFFFFFu;
+	s->overlaySeen = 0xFFFFFFFFu;
+	s->overlayShow = false;
 }
 
 bool TryOpenShm(QvdSource *s, uint64_t now)
@@ -630,12 +657,44 @@ bool ReadDescriptor(QvdSource *s)
 	return false;
 }
 
+// The game's performance overlay panel (user decision 2026-11-06: in the headset and in the recording).
+// Shown while the game has it on and keeps updating it (once a second).
+void PollOverlay(QvdSource *s, uint64_t now)
+{
+	QvdShared *m = s->shm;
+	s->overlayShow = false;
+	if (!m || !m->overlayVisible || !s->shared)
+		return;
+	const uint64_t tick = m->overlayTickMs;
+	if (tick == 0 || (now > tick && now - tick >= QVD_OVERLAY_TIMEOUT_MS))
+		return;
+	const uint32_t a = m->overlaySeq;
+	if (!(a & 1u) && a != s->overlaySeen) {
+		const size_t bytes = (size_t)QVD_OVERLAY_W * QVD_OVERLAY_H * 4;
+		s->overlayPx.resize(bytes);
+		MemoryBarrier();
+		memcpy(s->overlayPx.data(), m->overlayPixels, bytes);
+		MemoryBarrier();
+		if (m->overlaySeq == a) {
+			if (!s->overlayTex)
+				s->overlayTex = gs_texture_create(QVD_OVERLAY_W, QVD_OVERLAY_H, GS_RGBA, 1, nullptr, GS_DYNAMIC);
+			if (s->overlayTex)
+				gs_texture_set_image(s->overlayTex, s->overlayPx.data(), QVD_OVERLAY_W * 4, false);
+			if (s->overlaySeen == 0xFFFFFFFFu)
+				LOG(LOG_INFO, "performance overlay: the game shows it - drawn at the top left of the video");
+			s->overlaySeen = a;
+		}
+	}
+	s->overlayShow = s->overlayTex != nullptr && s->overlaySeen != 0xFFFFFFFFu;
+}
+
 void PollLayer(QvdSource *s)
 {
 	const uint64_t now = GetTickCount64();
 	if (!TryOpenShm(s, now))
 		return;
 
+	s->shm->wantEye = s->eye;   // v5: the eye this source shows
 	s->shm->readerTickMs = now; // tells the layer that OBS is showing the picture
 
 	if (ReadDescriptor(s) && s->handle) {
@@ -710,6 +769,7 @@ void PollLayer(QvdSource *s)
 			}
 		}
 	}
+	PollOverlay(s, now);
 }
 
 // ---------------------------------------------------------------- quad views: combine like the headset
@@ -1431,6 +1491,34 @@ const char *qvd_get_name(void *)
 	return obs_module_text("ArchanVRCapture");
 }
 
+// The overlay key and the on/off checkbox (user decision 2026-11-07: a checkbox in the source, off by default)
+// go to overlay.ini, which the layer in the game reads (so it works with OBS closed too). A key that is not
+// valid is not saved (the last good one stays); the checkbox is always saved.
+void SaveOverlaySettings(const char *text, bool enabled)
+{
+	QvdOverlaySettings st;
+	bool exists = false;
+	for (int i = 0; i < 20 && !qvd_overlay_read(&st, &exists); i++)
+		Sleep(10); // being replaced right now
+	QvdKey k;
+	char canon[64] = "";
+	if (qvd_parse_key(text, &k))
+		qvd_format_key(k, canon, sizeof(canon));
+	else
+		LOG(LOG_WARNING, "overlay key '%s' is not a key - %s kept", text ? text : "", st.key);
+	const bool keyChange = canon[0] && strcmp(st.key, canon) != 0;
+	if (exists && !keyChange && st.enabled == enabled)
+		return;
+	if (keyChange)
+		strcpy_s(st.key, sizeof(st.key), canon);
+	st.enabled = enabled;
+	if (qvd_overlay_write(st))
+		LOG(LOG_INFO, "performance overlay %s, key %s - saved to %ls", enabled ? "ON" : "OFF", st.key,
+		    qvd_overlay_settings_path());
+	else
+		LOG(LOG_WARNING, "overlay settings: cannot write %ls (error %lu)", qvd_overlay_settings_path(), GetLastError());
+}
+
 void qvd_update(void *data, obs_data_t *settings)
 {
 	QvdSource *s = static_cast<QvdSource *>(data);
@@ -1445,6 +1533,12 @@ void qvd_update(void *data, obs_data_t *settings)
 	s->lastSizeRequest = 0; // act on the new choice right away
 	LOG(LOG_INFO, "recording resolution mode: %s",
 	    s->modeHmd ? "HMD res (automatic)" : (is1440 ? "2560x1440" : "1920x1080"));
+	// which eye (user decision 2026-11-07): sent to the layer with every poll, and to the SteamVR mirror
+	const uint32_t eye = obs_data_get_int(settings, "eye") == 1 ? 1u : 0u;
+	if (eye != s->eye.load())
+		LOG(LOG_INFO, "eye: %s", eye ? "right" : "left");
+	s->eye = eye;
+	g_wantEye = (int)eye;
 
 	stab::Settings st;
 	st.enable = obs_data_get_bool(settings, "stab_enable");
@@ -1459,6 +1553,7 @@ void qvd_update(void *data, obs_data_t *settings)
 	}
 	s->delayNs = st.enable ? (int64_t)std::llround(st.delay * 1e9) : 0;
 	AudioRefresh(s);
+	SaveOverlaySettings(obs_data_get_string(settings, "overlay_key"), obs_data_get_bool(settings, "overlay_enabled"));
 	LOG(LOG_INFO, "stabilization: %s, smoothness %.0f, keep horizon level %s, crop %.1f %%, video delay %.2f s",
 	    st.enable ? "on" : "off", st.smooth, st.horizon ? "yes" : "no", st.crop, st.delay);
 }
@@ -1528,6 +1623,9 @@ void qvd_destroy(void *data)
 	if (s->compEffect)
 		gs_effect_destroy(s->compEffect);
 	s->compEffect = nullptr;
+	if (s->overlayTex)
+		gs_texture_destroy(s->overlayTex);
+	s->overlayTex = nullptr;
 	FreeBuffer(s);
 	obs_leave_graphics();
 	if (s->recorder.f) {
@@ -1600,6 +1698,25 @@ void qvd_video_render(void *data, gs_effect_t *)
 	CostAccount(s, (double)(os_gettime_ns() - t0) * 1e-6);
 }
 
+// The panel at the top left of the video: 384 x 120 at 1080p, scaled with the video height.
+// Premultiplied alpha, bytes drawn as they are (display-ready grey levels).
+void DrawOverlay(QvdSource *s, float cy)
+{
+	const float scale = cy / 1080.0f * 0.8f, margin = cy / 1080.0f * 24.0f;
+	gs_effect_t *e = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_enable_framebuffer_srgb(false);
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	gs_effect_set_texture(gs_effect_get_param_by_name(e, "image"), s->overlayTex);
+	gs_matrix_push();
+	gs_matrix_translate3f(margin, margin, 0.0f);
+	gs_matrix_scale3f(scale, scale, 1.0f);
+	while (gs_effect_loop(e, "Draw"))
+		gs_draw_sprite(s->overlayTex, 0, QVD_OVERLAY_W, QVD_OVERLAY_H);
+	gs_matrix_pop();
+	gs_blend_state_pop();
+}
+
 void qvd_video_render_inner(QvdSource *s)
 {
 	Poll(s);
@@ -1659,6 +1776,8 @@ void qvd_video_render_inner(QvdSource *s)
 		gs_matrix_pop();
 	}
 
+	if (s->picKind == 1 && s->overlayShow)
+		DrawOverlay(s, cy);
 	gs_enable_framebuffer_srgb(prevSrgb);
 }
 
@@ -1735,6 +1854,78 @@ void KeepVideoSize(QvdSource *s)
 	obs_queue_task(OBS_TASK_UI, SetVideoSizeTask, new SizeRequest{cx, cy}, false);
 }
 
+// Under the key field: what it does, or that the text is not a key.
+bool OverlayKeyModified(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+	obs_property_t *info = obs_properties_get(props, "overlay_info");
+	if (!info)
+		return false;
+	const char *text = obs_data_get_string(settings, "overlay_key");
+	QvdKey k;
+	struct dstr d = {};
+	if (qvd_parse_key(text, &k)) {
+		char canon[64];
+		qvd_format_key(k, canon, sizeof(canon));
+		dstr_printf(&d, obs_module_text("Overlay.Help.Key"), canon);
+		obs_property_set_description(info, d.array);
+		obs_property_text_set_info_type(info, OBS_TEXT_INFO_NORMAL);
+	} else {
+		dstr_printf(&d, obs_module_text("Overlay.Help.Bad"), text ? text : "");
+		obs_property_set_description(info, d.array);
+		obs_property_text_set_info_type(info, OBS_TEXT_INFO_ERROR);
+	}
+	dstr_free(&d);
+	return true;
+}
+
+// "Save logs" button (user decision 2026-11-08): one zip on the Desktop with our layer.log and the OBS logs and OBS
+// crash reports of the last 48 h, then Explorer opens with the zip selected. Nothing is uploaded; the user sends the file themselves.
+bool SaveLogsClicked(obs_properties_t *, obs_property_t *, void *)
+{
+	std::wstring desktop;
+	PWSTR d = nullptr;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &d)))
+		desktop = d;
+	CoTaskMemFree(d);
+	auto configDir = [](const char *sub) {
+		std::wstring dir;
+		if (char *u = os_get_config_path_ptr(sub)) {
+			wchar_t *w = nullptr;
+			if (os_utf8_to_wcs_ptr(u, 0, &w) && w)
+				dir = w;
+			bfree(w);
+			bfree(u);
+		}
+		return dir;
+	};
+	const std::wstring obsLogs = configDir("obs-studio/logs"), obsCrashes = configDir("obs-studio/crashes");
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	wchar_t name[96];
+	swprintf_s(name, L"\\ArchanVRCapture-logs-%04u%02u%02u-%02u%02u%02u.zip", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+		   t.wSecond);
+	const std::wstring zip = desktop + name;
+	FILETIME now;
+	GetSystemTimeAsFileTime(&now);
+	QvdLogZipResult r;
+	if (desktop.empty())
+		r.error = "the Desktop folder was not found";
+	else
+		r = qvd_save_logs_zip(qvd_log_dir(), obsLogs, zip, now, 48.0, obsCrashes);
+	if (r.ok) {
+		std::string list;
+		for (const std::string &n : r.names)
+			list += (list.empty() ? "" : ", ") + n;
+		LOG(LOG_INFO, "save logs: %s, %d files, %llu bytes: %s", qvd_narrow(zip).c_str(), r.files, r.bytes, list.c_str());
+		ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + zip + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+	} else {
+		LOG(LOG_WARNING, "save logs failed: %s", r.error.c_str());
+		const std::string msg = std::string(obs_module_text("SaveLogs.Failed")) + "\n\n" + r.error;
+		MessageBoxA(GetActiveWindow(), msg.c_str(), obs_module_text("ArchanVRCapture"), MB_OK | MB_ICONWARNING);
+	}
+	return false;
+}
+
 obs_properties_t *qvd_get_properties(void *data)
 {
 	QvdSource *s = static_cast<QvdSource *>(data);
@@ -1747,13 +1938,15 @@ obs_properties_t *qvd_get_properties(void *data)
 	if (s && s->picKind == 1 && s->shm && s->handle) {
 		const QvdRect c = qvd_center_crop_16x9(s->width, s->height);
 		dstr_printf(&status, "%s: %s | %s | %s %ux%u | 16:9 %ux%u", obs_module_text("Status.Connected"),
-			    s->shm->appName, s->shm->runtimeName, obs_module_text("Status.LeftEye"), s->width,
+			    s->shm->appName, s->shm->runtimeName,
+			    obs_module_text(s->shm->picEye == 1 ? "Status.RightEye" : "Status.LeftEye"), s->width,
 			    s->height, c.w, c.h);
 	} else if (s && s->picKind == 2) {
 		const uint32_t w = s->picW, h = s->picH;
 		const QvdRect c = qvd_center_crop_16x9(w, h);
 		dstr_printf(&status, "%s: %s | %s %ux%u | 16:9 %ux%u", obs_module_text("Status.Connected"),
-			    obs_module_text("Status.SteamVR"), obs_module_text("Status.LeftEye"), w, h, c.w, c.h);
+			    obs_module_text("Status.SteamVR"),
+			    obs_module_text(s->eye == 1 ? "Status.RightEye" : "Status.LeftEye"), w, h, c.w, c.h);
 	} else {
 		dstr_copy(&status, obs_module_text("Status.Waiting"));
 	}
@@ -1768,6 +1961,16 @@ obs_properties_t *qvd_get_properties(void *data)
 	obs_property_list_add_string(list, obs_module_text("Mode.Hmd"), MODE_HMD);
 	obs_property_list_add_string(list, obs_module_text("Mode.1440"), MODE_1440);
 	obs_property_list_add_string(list, obs_module_text("Mode.1080"), MODE_1080);
+	obs_property_t *eyeList = obs_properties_add_list(props, "eye", obs_module_text("Eye"), OBS_COMBO_TYPE_LIST,
+							  OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(eyeList, obs_module_text("Eye.Left"), 0);
+	obs_property_list_add_int(eyeList, obs_module_text("Eye.Right"), 1);
+
+	obs_properties_add_bool(props, "overlay_enabled", obs_module_text("Overlay.Enabled"));
+	obs_property_t *key = obs_properties_add_text(props, "overlay_key", obs_module_text("Overlay.Key"), OBS_TEXT_DEFAULT);
+	obs_property_t *keyInfo = obs_properties_add_text(props, "overlay_info", obs_module_text("Overlay.Help"), OBS_TEXT_INFO);
+	obs_property_text_set_info_word_wrap(keyInfo, true);
+	obs_property_set_modified_callback(key, OverlayKeyModified);
 
 	// stabilization: the group's checkbox is On / Off
 	obs_properties_t *sp = obs_properties_create();
@@ -1787,23 +1990,44 @@ obs_properties_t *qvd_get_properties(void *data)
 	obs_property_t *delay = obs_properties_add_float_slider(sp, "stab_delay", obs_module_text("Stab.Delay"), 0.1, 2.0, 0.05);
 	obs_property_float_set_suffix(delay, " s");
 	obs_properties_add_group(props, "stab_enable", obs_module_text("Stab.Group"), OBS_GROUP_CHECKABLE, sp);
+
+	obs_properties_add_button2(props, "save_logs", obs_module_text("SaveLogs"), SaveLogsClicked, s);
+	obs_property_t *logsInfo = obs_properties_add_text(props, "save_logs_info", obs_module_text("SaveLogs.Help"), OBS_TEXT_INFO);
+	obs_property_text_set_info_word_wrap(logsInfo, true);
 	return props;
 }
 
 void qvd_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "resolution", MODE_HMD);
+	obs_data_set_default_int(settings, "eye", 0); // left (user decision 2026-11-07)
 	obs_data_set_default_bool(settings, "stab_enable", true);
 	obs_data_set_default_int(settings, "stab_smooth", 100); // user decision 2026-11-06
 	obs_data_set_default_bool(settings, "stab_horizon", false);
 	obs_data_set_default_double(settings, "stab_crop", 15.0);  // user decision 2026-11-05 after VD/Q3 test
 	obs_data_set_default_double(settings, "stab_delay", 0.20); // user decision 2026-11-05 after VD/Q3 test
+	obs_data_set_default_string(settings, "overlay_key", QVD_OVERLAY_DEFAULT_KEY); // user decision 2026-11-06
+	obs_data_set_default_bool(settings, "overlay_enabled", false);                 // user decision 2026-11-07
 }
 
 } // namespace
 
+// "OBS is running" for the layer in the game (user decision 2026-11-07: the overlay is shown by default
+// while OBS runs). Held from module load to unload; any integrity level may open it.
+static HANDLE g_obsPresence = nullptr;
+
 bool obs_module_load(void)
 {
+	{
+		SECURITY_DESCRIPTOR sd;
+		InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+		SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
+		SECURITY_ATTRIBUTES sa = {sizeof(sa), &sd, FALSE};
+		g_obsPresence = CreateMutexW(&sa, FALSE, qvd_obs_presence_name());
+		if (!g_obsPresence)
+			blog(LOG_WARNING, "[archan-vr-capture] presence mutex failed (error %lu): the overlay will not show by "
+			     "itself while OBS runs", GetLastError());
+	}
 	struct obs_source_info info = {};
 	info.id = "archan_vr_capture";
 	info.type = OBS_SOURCE_TYPE_INPUT;
@@ -1864,6 +2088,10 @@ extern "C" __declspec(dllexport) void archan_vr_capture_test_audio_saveload(obs_
 
 void obs_module_unload(void)
 {
+	if (g_obsPresence) {
+		CloseHandle(g_obsPresence);
+		g_obsPresence = nullptr;
+	}
 	obs_frontend_remove_event_callback(OnFrontendEvent, nullptr);
 	obs_frontend_remove_save_callback(AudioSaveLoad, nullptr);
 	if (g_vrThread.joinable()) {

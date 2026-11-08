@@ -15,7 +15,7 @@ add_compile_options(/W3 /utf-8)
 # ---------------------------------------------------------------- OpenXR layer (loaded into the game)
 add_library(XR_APILAYER_ARCHAN_vr_capture SHARED layer/layer.cpp)
 target_include_directories(XR_APILAYER_ARCHAN_vr_capture PRIVATE "${DEPS}/openxr-sdk/include")
-target_link_libraries(XR_APILAYER_ARCHAN_vr_capture PRIVATE d3d11 dxgi shell32 ole32)
+target_link_libraries(XR_APILAYER_ARCHAN_vr_capture PRIVATE d3d11 dxgi shell32 ole32 pdh gdi32 user32)
 # static CRT: nothing extra has to exist next to the game
 set_property(TARGET XR_APILAYER_ARCHAN_vr_capture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 add_custom_command(TARGET XR_APILAYER_ARCHAN_vr_capture POST_BUILD
@@ -43,6 +43,11 @@ add_custom_command(TARGET archan-vr-capture POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DEPS}/openvr/bin/win64/openvr_api.dll"
             "$<TARGET_FILE_DIR:archan-vr-capture>/openvr_api.dll")
+
+# ---------------------------------------------------------------- settings window (overlay on/off + key)
+add_executable(ArchanVRCaptureSettings WIN32 tools/settings/settings_app.cpp)
+target_link_libraries(ArchanVRCaptureSettings PRIVATE user32 gdi32 comctl32)
+set_property(TARGET ArchanVRCaptureSettings PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 # ---------------------------------------------------------------- proof tests
 add_executable(layer_mock_test tests/layer_mock_test.cpp)
